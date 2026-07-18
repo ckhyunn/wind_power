@@ -157,6 +157,47 @@ def aggregate_weather_idw(df: pd.DataFrame, grid_dist: pd.DataFrame, prefix: str
     return agg.reset_index()
 
 
+def lead_time_feature(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    예보 리드타임(발표 후 몇 시간짜리 예측인지) 피처.
+    forecast_kst_dtm 하나당 grid_id가 여러 개 있지만 data_available_kst_dtm은
+    같은 시각 내에서 전부 동일하므로, 대표로 1개 grid만 남겨서 계산.
+
+    일반적으로 예보는 리드타임이 길수록(먼 미래를 예측할수록) 부정확해지므로
+    모델이 이 정보를 참고할 수 있게 함.
+    """
+    df = df.copy()
+    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
+    df["data_available_kst_dtm"] = pd.to_datetime(df["data_available_kst_dtm"])
+    rep = df.drop_duplicates(subset="forecast_kst_dtm")[["forecast_kst_dtm", "data_available_kst_dtm"]].copy()
+    rep["lead_time_hours"] = (rep["forecast_kst_dtm"] - rep["data_available_kst_dtm"]).dt.total_seconds() / 3600
+    return rep[["forecast_kst_dtm", "lead_time_hours"]]
+
+
+def nearest_grid_raw_features(df: pd.DataFrame, grid_dist: pd.DataFrame, prefix: str, top_n: int = 1) -> pd.DataFrame:
+    """
+    최근접 격자 top_n개의 '원본' 값을 각각 별도 컬럼으로 제공 (평균/가중평균으로 뭉개지 않음).
+    평균은 정보 손실이 있을 수 있어, 가장 가까운 격자 원본값을 모델이 직접 보게 해서
+    LightGBM이 스스로 유용한 조합을 찾을 여지를 줌.
+
+    grid_dist: nearest_grids_with_distance()의 결과, 거리순 정렬되어 있다고 가정
+    """
+    grid_dist_sorted = grid_dist.sort_values("dist").reset_index(drop=True)
+    top_grid_ids = grid_dist_sorted["grid_id"].tolist()[:top_n]
+
+    drop_cols = {"data_available_kst_dtm", "grid_id", "latitude", "longitude"}
+    result = None
+    for rank, grid_id in enumerate(top_grid_ids, start=1):
+        sub = df[df["grid_id"] == grid_id].copy()
+        sub["forecast_kst_dtm"] = pd.to_datetime(sub["forecast_kst_dtm"])
+        value_cols = [c for c in sub.columns if c not in {"forecast_kst_dtm", *drop_cols}]
+        sub = sub[["forecast_kst_dtm", *value_cols]].copy()
+        sub.columns = ["forecast_kst_dtm"] + [f"{prefix}_nearest{rank}_{c}" for c in value_cols]
+        result = sub if result is None else result.merge(sub, on="forecast_kst_dtm", how="outer")
+
+    return result
+
+
 def calendar_features(dt_series: pd.Series) -> pd.DataFrame:
     dt = pd.to_datetime(dt_series)
     out = pd.DataFrame(index=dt.index)

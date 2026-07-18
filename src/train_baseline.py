@@ -1,5 +1,5 @@
 """
-LightGBM 베이스라인 (v7).
+LightGBM 베이스라인 (v11).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -21,6 +21,14 @@ LightGBM 베이스라인 (v7).
      -> RandomForest를 LightGBM으로 교체 (부스팅 계열은 극단값을 평균으로 당기는 경향이 적어
         RandomForest 특유의 과소예측 편향 자체를 줄이는 효과를 기대). calib을 조기종료
         검증셋으로 사용해 과적합 방지.
+     (v8 IDW, v9 고풍속플래그, v10 하이퍼파라미터탐색 -> 셋 다 calib 기준 개선이 holdout엔
+      반영 안 됨. calib 60일로 '여러 선택지 중 고르기'를 반복한 게 원인으로 진단됨)
+  9. v11: 진단에 따라 방향 전환 - '선택/탐색' 대신 '원칙에 기반한 확정 변경 + 무조건 앙상블'로.
+     - objective를 기본값(L2) 대신 'mae'(L1)로 고정: 평가지표(NMAE, FICR)가 절대오차
+       기반이라 학습 목적함수를 일치시킴 (탐색 아님, 원리적 결정)
+     - 시드 3개 앙상블 (평균): '고르기'가 아니라 '항상 평균'이라 과적합 위험 없이 분산 감소
+     - 리드타임(lead_time_hours) 피처 추가
+     - 최근접 격자 원본값(평균으로 뭉개지 않은 값)을 별도 피처로 추가
 
 실행:
     python src/train_baseline.py
@@ -41,8 +49,11 @@ from features import (
     load_turbine_table,
     compute_group_coords,
     nearest_grid_ids,
+    nearest_grids_with_distance,
     add_wind_features,
     aggregate_weather_for_group,
+    lead_time_feature,
+    nearest_grid_raw_features,
     calendar_features,
 )
 from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile
@@ -69,7 +80,8 @@ class _Reshape1DWrapper:
 
 
 def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: dict) -> dict:
-    """그룹별로 (LDAPS+GFS 병합, 풍속 파생피처까지 포함된) 날씨 피처 테이블 생성"""
+    """그룹별로 (LDAPS+GFS 병합, 풍속 파생피처 + 리드타임 + 최근접 격자 원본값까지 포함된)
+    날씨 피처 테이블 생성"""
     group_weather = {}
     for group, coord in group_coords.items():
         lat, lon = coord["lat"], coord["lon"]
@@ -90,6 +102,26 @@ def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: di
         )
         weather = add_wind_features(
             weather, "gfs_heightAboveGround_100_100u_mean", "gfs_heightAboveGround_100_100v_mean", "gfs_ws100"
+        )
+
+        # 리드타임 피처 (LDAPS 기준 - LDAPS/GFS 모두 동일한 발표 스케줄을 쓰므로 대표로 사용)
+        lead = lead_time_feature(ldaps)
+        weather = weather.merge(lead, on="forecast_kst_dtm", how="left")
+
+        # 최근접 격자 원본값 (평균으로 뭉개지 않은 값도 별도로 제공)
+        ldaps_grid_dist = nearest_grids_with_distance(ldaps, lat, lon, k=N_NEAREST_GRIDS)
+        gfs_grid_dist = nearest_grids_with_distance(gfs, lat, lon, k=N_NEAREST_GRIDS)
+        ldaps_nearest1 = nearest_grid_raw_features(ldaps, ldaps_grid_dist, "ldaps", top_n=1)
+        gfs_nearest1 = nearest_grid_raw_features(gfs, gfs_grid_dist, "gfs", top_n=1)
+        weather = weather.merge(ldaps_nearest1, on="forecast_kst_dtm", how="left")
+        weather = weather.merge(gfs_nearest1, on="forecast_kst_dtm", how="left")
+
+        # 최근접 격자 원본 U/V에도 풍속/풍향 파생피처 적용
+        weather = add_wind_features(
+            weather, "ldaps_nearest1_heightAboveGround_10_10u", "ldaps_nearest1_heightAboveGround_10_10v", "ldaps_nearest1_ws10"
+        )
+        weather = add_wind_features(
+            weather, "gfs_nearest1_heightAboveGround_100_100u", "gfs_nearest1_heightAboveGround_100_100v", "gfs_nearest1_ws100"
         )
 
         group_weather[group] = weather
@@ -154,7 +186,13 @@ def main():
         X_cal_imp = pd.DataFrame(imputer.transform(X_cal), columns=X_cal.columns)
         X_ho_imp = pd.DataFrame(imputer.transform(X_ho), columns=X_ho.columns)
 
-        model = lgb.LGBMRegressor(
+        # v11: 두 가지 확정적 변경 (선택/탐색이 아니라 원칙에 기반한 결정이라 calib 과적합 위험 없음)
+        #  1) objective를 기본값(L2, 제곱오차) 대신 'mae'(L1)로 고정.
+        #     대회 평가지표(NMAE, FICR)가 전부 절대오차 기반이라 학습 목적함수를 일치시킴.
+        #  2) 시드 3개 앙상블. '고르기'가 아니라 '항상 평균'이라 과적합 위험이 없고
+        #     분산을 줄여줌 (v8~v10에서 반복된 calib 과적합 패턴과는 성격이 다름).
+        SEEDS = [42, 123, 2024]
+        LGBM_PARAMS = dict(
             n_estimators=2000,
             learning_rate=0.03,
             max_depth=7,
@@ -164,25 +202,34 @@ def main():
             colsample_bytree=0.8,
             reg_alpha=0.1,
             reg_lambda=0.1,
-            random_state=42,
+            objective="mae",
             n_jobs=-1,
             verbose=-1,
         )
-        # calib을 조기종료 검증셋으로 사용 (holdout은 절대 학습/조기종료에 쓰지 않음)
-        model.fit(
-            X_tr_imp, y_tr,
-            eval_set=[(X_cal_imp, y_cal)],
-            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
-        )
-        best_iteration = model.best_iteration_
-        print(f"[{target}] LightGBM 조기종료 - best_iteration={best_iteration}")
+
+        def ensemble_predict(models, X_imp):
+            preds = np.column_stack([m.predict(X_imp) for m in models])
+            return preds.mean(axis=1)
+
+        models = []
+        best_iterations = []
+        for seed in SEEDS:
+            m = lgb.LGBMRegressor(random_state=seed, **LGBM_PARAMS)
+            m.fit(
+                X_tr_imp, y_tr,
+                eval_set=[(X_cal_imp, y_cal)],
+                callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+            )
+            models.append(m)
+            best_iterations.append(m.best_iteration_)
+        print(f"[{target}] 앙상블 {len(SEEDS)}개 시드, best_iteration={best_iterations}")
 
         # calib 구간에서 '보정식' 학습.
         # v4에서 isotonic이 calib 데이터 부족으로 과적합해 오히려 성능이 나빠진 것을 확인했음.
         # -> calib을 다시 앞/뒤로 나눠(calib_fit/calib_val), 선형과 isotonic 둘 다 calib_fit으로
         #    학습한 뒤 calib_val(둘 다 안 본 데이터)에서 어느 쪽이 더 나은지 비교해서 자동 선택.
         #    선택된 방식은 calib 전체(calib_fit+calib_val)로 다시 학습해서 최종 사용.
-        pred_cal = model.predict(X_cal_imp)
+        pred_cal = ensemble_predict(models, X_cal_imp)
         n_cal = len(pred_cal)
         split = n_cal // 2
         pred_cal_fit, pred_cal_val = pred_cal[:split], pred_cal[split:]
@@ -216,24 +263,28 @@ def main():
         print(f"[{target}] 보정 방식 선택: {chosen} (calib_val 오차율 - linear={linear_err:.4f}, isotonic={isotonic_err:.4f})")
 
         # holdout에서 raw 예측 vs 보정 후 예측 둘 다 계산해서 개선 여부 확인
-        pred_ho_raw = np.clip(model.predict(X_ho_imp), 0, CAPACITY_KWH[target])
+        pred_ho_raw = np.clip(ensemble_predict(models, X_ho_imp), 0, CAPACITY_KWH[target])
         pred_ho_calibrated = np.clip(calibrator.predict(pred_ho_raw), 0, CAPACITY_KWH[target])
 
         predictions_holdout_raw[target] = pred_ho_raw
         predictions_holdout_calibrated[target] = pred_ho_calibrated
         holdout_actual[target] = y_ho.values
 
-        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 재학습 후, 같은 보정식 적용
-        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 앞서 찾은 best_iteration을 그대로 사용
-        model.set_params(n_estimators=best_iteration)
+        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 시드별 재학습 후 같은 보정식 적용
+        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 각 시드에서 찾은 best_iteration을 그대로 사용
         X_fit = pd.concat([X_tr, X_cal])
         y_fit = pd.concat([y_tr, y_cal])
         X_fit_imp = pd.DataFrame(imputer.fit_transform(X_fit), columns=X_fit.columns)
-        model.fit(X_fit_imp, y_fit)
+
+        final_models = []
+        for seed, best_iter in zip(SEEDS, best_iterations):
+            fm = lgb.LGBMRegressor(random_state=seed, **{**LGBM_PARAMS, "n_estimators": best_iter})
+            fm.fit(X_fit_imp, y_fit)
+            final_models.append(fm)
 
         X_test = build_features(sample_submission[["forecast_id", "forecast_kst_dtm"]], test_weather[target], "forecast_kst_dtm")
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
-        pred_test_raw = np.clip(model.predict(X_test_imp), 0, CAPACITY_KWH[target])
+        pred_test_raw = np.clip(ensemble_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
         pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
         predictions_test[target] = pred_test_calibrated
 
@@ -271,7 +322,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v7_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v11_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

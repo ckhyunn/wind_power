@@ -1,5 +1,5 @@
 """
-LightGBM+XGBoost 블렌딩 베이스라인 (v17).
+LightGBM+XGBoost 블렌딩 베이스라인 (v18).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -76,6 +76,7 @@ from features import (
     nearest_grids_with_distance,
     add_wind_features,
     aggregate_weather_for_group,
+    aggregate_weather_dispersion,
     lead_time_feature,
     nearest_grid_raw_features,
     add_air_density_feature,
@@ -169,6 +170,19 @@ def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: di
         # v17: 인접 시간대(전/후 1시간) 풍속 - 지금까지 매 시간을 독립적으로 취급했는데,
         # 처음으로 시간적 흐름(급변/돌풍 여부) 정보를 제공
         weather = add_lag_lead_features(weather, ["gfs_ws100_speed", "ldaps_ws10_speed"])
+
+        # v18: 격자 간 분산(불확실성) 피처. 지금까지 최근접 격자들을 평균으로만 썼는데,
+        # 격자 간 편차가 크다는 건 그 시간대 예보 자체가 불확실하거나 국지적으로
+        # 변동성이 큰 상황이라는 신호. 완전히 새로운 종류의 정보.
+        ldaps_disp = aggregate_weather_dispersion(
+            ldaps, ldaps_grids, ["heightAboveGround_10_10u", "heightAboveGround_10_10v"], "ldaps"
+        )
+        gfs_disp = aggregate_weather_dispersion(
+            gfs, gfs_grids, ["heightAboveGround_10_10u", "heightAboveGround_10_10v",
+                              "heightAboveGround_100_100u", "heightAboveGround_100_100v"], "gfs"
+        )
+        weather = weather.merge(ldaps_disp, on="forecast_kst_dtm", how="left")
+        weather = weather.merge(gfs_disp, on="forecast_kst_dtm", how="left")
 
         group_weather[group] = weather
     return group_weather
@@ -357,7 +371,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v17_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v18_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

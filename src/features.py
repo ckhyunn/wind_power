@@ -168,6 +168,22 @@ def aggregate_weather_for_group(df: pd.DataFrame, grid_ids: list, prefix: str) -
     return agg.reset_index()
 
 
+def aggregate_weather_dispersion(df: pd.DataFrame, grid_ids: list, cols: list, prefix: str) -> pd.DataFrame:
+    """
+    지정된 grid_ids 간의 값 차이(표준편차)를 피처로 만듦.
+    지금까지는 격자들을 평균으로 뭉개기만 했는데, 격자 간 편차가 크다는 건
+    '이 시간대는 지역별로 바람이 크게 다르다 = 예보 자체가 불확실하거나 국지적으로
+    변동성이 큰 상황'이라는 신호일 수 있음. 지금까지 한 번도 사용하지 않은 정보.
+
+    cols: 표준편차를 계산할 컬럼 목록 (예: ['heightAboveGround_10_10u', ...])
+    """
+    df = df[df["grid_id"].isin(grid_ids)].copy()
+    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
+    disp = df.groupby("forecast_kst_dtm")[cols].std()
+    disp.columns = [f"{prefix}_{c}_std" for c in disp.columns]
+    return disp.reset_index()
+
+
 def aggregate_weather_idw(df: pd.DataFrame, grid_dist: pd.DataFrame, prefix: str, power: float = 2.0) -> pd.DataFrame:
     """
     거리 가중 평균(IDW, Inverse Distance Weighting)으로 그룹 전용 날씨 피처를 만듦.

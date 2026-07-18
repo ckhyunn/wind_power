@@ -1,5 +1,5 @@
 """
-LightGBM 베이스라인 (v13).
+LightGBM 베이스라인 (v11).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -286,11 +286,7 @@ def main():
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
         pred_test_raw = np.clip(ensemble_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
         pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
-        # v13: backtest.py로 5개 윈도우 검증한 결과, 보정(calibration)이 평균적으로 오히려
-        # Score를 낮추고 분산도 키움(raw 평균 0.5916 ±0.0088 vs 보정 후 0.5868 ±0.0170).
-        # 계절마다 보정 효과가 들쭉날쭉해서 일관되게 도움이 안 됨 -> 최종 제출은 raw 사용.
-        # (보정 로직 자체는 남겨둠 - 나중에 계절별 보정 등으로 재시도할 수 있음)
-        predictions_test[target] = pred_test_raw
+        predictions_test[target] = pred_test_calibrated
 
         print(f"[{target}] train={len(X_tr)}, calib={len(X_cal)}, holdout={len(X_ho)}")
 
@@ -326,7 +322,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v13_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v11_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

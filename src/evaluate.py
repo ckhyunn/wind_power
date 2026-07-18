@@ -128,6 +128,52 @@ def bias_diagnosis(answer_df: pd.DataFrame, pred_df: pd.DataFrame, target_cols=T
 
 
 # 하위호환: 기존 train_baseline.py가 import하던 이름 유지
+def bias_by_prediction_quantile(answer_df: pd.DataFrame, pred_df: pd.DataFrame, target_cols=TARGET_COLS, capacity=CAPACITY_KWH, n_bins: int = 5) -> pd.DataFrame:
+    """
+    예측값 크기 구간(quantile)별로 편향을 나눠서 보여주는 진단 함수.
+
+    목적: '일괄 선형 보정'이 맞는 방식인지, 아니면 '예측값 크기에 따라 다른 보정'이
+    필요한지 판단하기 위함. RandomForest 계열은 통상 예측값이 클수록(고발전 구간)
+    평균으로 수렴하려는 경향 때문에 과소예측이 더 커지는 경우가 많음.
+
+    각 구간(bin)마다:
+      - 편향률: (예측-실제)/설비용량의 평균
+      - 8%초과_비율: 그 구간에서 오차율 8% 초과(정산금 0) 비율
+    """
+    rows = []
+    for col in target_cols:
+        actual = answer_df[col].to_numpy(dtype=float)
+        forecast = pred_df[col].to_numpy(dtype=float)
+        cap = capacity[col]
+
+        valid = actual >= cap * 0.10
+        actual, forecast = actual[valid], forecast[valid]
+        if len(actual) == 0:
+            continue
+
+        # 예측값 크기 기준으로 n_bins개 구간으로 분할 (같은 개수씩)
+        try:
+            bins = pd.qcut(forecast, q=n_bins, duplicates="drop")
+        except ValueError:
+            continue
+
+        signed_error_rate = (forecast - actual) / cap
+        error_rate = np.abs(signed_error_rate)
+
+        df = pd.DataFrame({"bin": bins, "signed_error_rate": signed_error_rate, "error_rate": error_rate, "forecast": forecast})
+        grouped = df.groupby("bin", observed=True).agg(
+            예측값_범위_kWh=("forecast", lambda s: f"{s.min():.0f}~{s.max():.0f}"),
+            시간수=("forecast", "size"),
+            편향률=("signed_error_rate", "mean"),
+            평균오차율=("error_rate", "mean"),
+            **{"8%초과_비율": ("error_rate", lambda s: (s > 0.08).mean())},
+        )
+        grouped.insert(0, "group", col)
+        rows.append(grouped.reset_index(drop=True))
+
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
 def nmae_score(pred: pd.DataFrame, actual: pd.DataFrame, capacity: dict = CAPACITY_KWH) -> float:
     _, one_minus_nmae, _ = metric(actual, pred, target_cols=list(capacity.keys()), capacity=capacity)
     return one_minus_nmae

@@ -1,5 +1,5 @@
 """
-LightGBM 베이스라인 (v11).
+LightGBM 베이스라인 (v14).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -29,6 +29,12 @@ LightGBM 베이스라인 (v11).
      - 시드 3개 앙상블 (평균): '고르기'가 아니라 '항상 평균'이라 과적합 위험 없이 분산 감소
      - 리드타임(lead_time_hours) 피처 추가
      - 최근접 격자 원본값(평균으로 뭉개지 않은 값)을 별도 피처로 추가
+     (v12: holdout을 1년 전 구간으로 이동 + 시드 7개 확장 -> 실제 리더보드 하락, 미채택)
+     (backtest.py: 5개 시기 평균 검증 인프라 구축. raw vs 보정 실제 비교 결과 차이가
+      0.007 수준 노이즈로 확인되어 보정 있는 v11 방식 유지)
+  10. v14: SCADA 파워커브(물리 기반) 피처 추가. SCADA 실측 풍속은 예보 풍속과 스케일이
+      안 맞아 직접 못 쓰므로(v9에서 확인), 대신 '예보 풍속(gfs_ws100_speed) -> 실제
+      발전량'의 경험적 관계를 학습구간에서 isotonic으로 직접 적합해 강력한 단일 피처로 추가.
 
 실행:
     python src/train_baseline.py
@@ -55,6 +61,8 @@ from features import (
     lead_time_feature,
     nearest_grid_raw_features,
     calendar_features,
+    fit_power_curve,
+    apply_power_curve,
 )
 from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile
 
@@ -177,6 +185,19 @@ def main():
         is_calib = (dt_all > calib_start) & (dt_all <= cutoff)
         is_train = dt_all <= calib_start
 
+        # v14: 파워커브(물리 기반) 피처.
+        # SCADA 실측 풍속을 직접 쓰면 예보 풍속과 스케일이 안 맞는 문제가 있었음(v9에서 확인).
+        # 대신 '예보 풍속(gfs_ws100_speed) -> 실제 그룹 발전량'의 경험적 관계를 학습구간에서
+        # 직접 적합(isotonic, 단조증가)해서, "이 예보 풍속이면 과거엔 보통 이 정도 발전했다"는
+        # 강력한 단일 피처를 추가. LightGBM이 이걸 기준점 삼아 나머지 오차만 보정하면 되므로
+        # 학습이 쉬워질 것으로 기대. SCADA를 직접 쓰지 않아 스케일 불일치 문제를 우회함.
+        # (fit_power_curve/apply_power_curve는 features.py 공용 함수 - backtest.py도 동일하게 사용)
+        power_curve_col = "gfs_ws100_speed"
+        power_curve, fallback_ws = fit_power_curve(X_all.loc[is_train, power_curve_col], y_all[is_train])
+        X_all["power_curve_estimate"] = apply_power_curve(
+            power_curve, fallback_ws, X_all[power_curve_col], CAPACITY_KWH[target]
+        )
+
         X_tr, y_tr = X_all[is_train], y_all[is_train]
         X_cal, y_cal = X_all[is_calib], y_all[is_calib]
         X_ho, y_ho = X_all[is_holdout], y_all[is_holdout]
@@ -283,9 +304,15 @@ def main():
             final_models.append(fm)
 
         X_test = build_features(sample_submission[["forecast_id", "forecast_kst_dtm"]], test_weather[target], "forecast_kst_dtm")
+        X_test["power_curve_estimate"] = apply_power_curve(
+            power_curve, fallback_ws, X_test[power_curve_col], CAPACITY_KWH[target]
+        )
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
         pred_test_raw = np.clip(ensemble_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
         pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
+        # v13에서 raw로 바꿔 실제 리더보드 테스트한 결과, 보정 버전(v11, 0.6146)이
+        # raw(v13, 0.6073)보다 근소하게 나음. 백테스트는 반대였으나 차이(0.007)가 노이즈
+        # 수준이라 보정 여부 자체는 큰 지렛대가 아닌 것으로 결론. v11 방식(보정)으로 복귀.
         predictions_test[target] = pred_test_calibrated
 
         print(f"[{target}] train={len(X_tr)}, calib={len(X_cal)}, holdout={len(X_ho)}")
@@ -322,7 +349,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v11_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v14_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

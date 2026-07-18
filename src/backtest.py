@@ -29,7 +29,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LinearRegression
 
-from features import TARGET_COLS, CAPACITY_KWH, load_turbine_table, compute_group_coords
+from features import TARGET_COLS, CAPACITY_KWH, load_turbine_table, compute_group_coords, fit_power_curve, apply_power_curve
 from train_baseline import (
     build_group_weather,
     build_features,
@@ -93,6 +93,17 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
         is_holdout = (dt_all >= holdout_start) & (dt_all <= holdout_end)
         is_calib = (dt_all >= calib_start) & (dt_all <= calib_end)
         is_train = ~is_holdout & ~is_calib
+
+        if is_train.sum() == 0:
+            print(f"  [{target}] 학습 구간에 데이터가 없어 건너뜀")
+            continue
+
+        # v14와 동일한 파워커브 피처 (train_baseline.py와 반드시 같은 로직 - features.py 공용 함수 사용)
+        power_curve_col = "gfs_ws100_speed"
+        power_curve, fallback_ws = fit_power_curve(X_all.loc[is_train, power_curve_col], y_all[is_train])
+        X_all["power_curve_estimate"] = apply_power_curve(
+            power_curve, fallback_ws, X_all[power_curve_col], CAPACITY_KWH[target]
+        )
 
         X_tr, y_tr = X_all[is_train], y_all[is_train]
         X_cal, y_cal = X_all[is_calib], y_all[is_calib]

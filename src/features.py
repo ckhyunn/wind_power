@@ -17,6 +17,7 @@ info.xlsx 구조 (직접 확인한 결과):
 import re
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 
 TARGET_COLS = ["kpx_group_1", "kpx_group_2", "kpx_group_3"]
 
@@ -196,6 +197,28 @@ def nearest_grid_raw_features(df: pd.DataFrame, grid_dist: pd.DataFrame, prefix:
         result = sub if result is None else result.merge(sub, on="forecast_kst_dtm", how="outer")
 
     return result
+
+
+def fit_power_curve(wind_speed: pd.Series, generation: pd.Series):
+    """
+    '예보 풍속 -> 실제 발전량'의 경험적 관계를 isotonic(단조증가)으로 적합.
+    SCADA 실측 풍속은 예보 풍속과 스케일이 안 맞아 직접 못 쓰므로(diagnose_cutout.py에서 확인),
+    예보 풍속 자체를 입력으로 써서 스케일 불일치 문제를 우회함.
+
+    반드시 학습 구간(train)의 wind_speed/generation만 넣어야 함 (calib/holdout/test에 새어나가지 않게).
+
+    반환: (적합된 IsotonicRegression, 결측치 대체용 중앙값)
+    """
+    valid = wind_speed.notna()
+    curve = IsotonicRegression(out_of_bounds="clip", increasing=True)
+    curve.fit(wind_speed[valid], generation[valid])
+    fallback_ws = wind_speed[valid].median()
+    return curve, fallback_ws
+
+
+def apply_power_curve(curve, fallback_ws: float, wind_speed: pd.Series, capacity: float) -> np.ndarray:
+    """fit_power_curve()로 적합한 커브를 새 데이터(calib/holdout/test)에 적용"""
+    return np.clip(curve.predict(wind_speed.fillna(fallback_ws)), 0, capacity)
 
 
 def calendar_features(dt_series: pd.Series) -> pd.DataFrame:

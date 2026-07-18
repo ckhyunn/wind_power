@@ -1,63 +1,137 @@
-"""대회 평가 산식 구현.
+"""
+대회 공식 평가 산식 구현 (codeshare 14035 "평가 산식 코드" 그대로 이식).
 
-Score = 0.5 x (1 - NMAE) + 0.5 x FICR
+Score = 0.5 * (1-NMAE) + 0.5 * FICR
 
-- 그룹별 NMAE = mean(|예측 - 실제| / 그룹 설비용량),
-  단 실제발전량이 설비용량의 10% 이상인 시간대만 대상으로 계산한다.
-- 1 - NMAE = 1 - (3개 그룹 NMAE 평균)
-- FICR은 시간대별 정산금 계단 구간표를 기반으로 계산하나,
-  아직 구간값이 공개되지 않아 미구현 상태로 남겨둔다.
+- 평가는 실제발전량이 '그룹 설비용량의 10% 이상'인 시간대만 대상
+- FICR은 시간대별 오차율(error_rate = |pred-actual|/capacity)에 따라
+  계단식 단가(4.0 / 3.0 / 0.0)가 적용되는 정산금 구조
+    error_rate <= 0.06 -> 단가 4.0
+    error_rate <= 0.08 -> 단가 3.0
+    error_rate >  0.08 -> 단가 0.0  (정산금 0원)
 """
 
-from collections.abc import Mapping, Sequence
-
 import numpy as np
+import pandas as pd
 
-CAPACITY_THRESHOLD_RATIO = 0.1
+TARGET_COLS = ["kpx_group_1", "kpx_group_2", "kpx_group_3"]
 
-
-def _single_group_nmae(pred: np.ndarray, actual: np.ndarray, capacity: float) -> float:
-    pred = np.asarray(pred, dtype=float)
-    actual = np.asarray(actual, dtype=float)
-
-    mask = actual >= CAPACITY_THRESHOLD_RATIO * capacity
-    if not mask.any():
-        return 0.0
-
-    return float(np.mean(np.abs(pred[mask] - actual[mask]) / capacity))
+CAPACITY_KWH = {
+    "kpx_group_1": 21600,
+    "kpx_group_2": 21600,
+    "kpx_group_3": 21000,
+}
 
 
-def nmae_score(pred, actual, capacity) -> float:
-    """NMAE를 계산한다. (값이 작을수록 좋음, 1-NMAE가 아니라 NMAE 자체를 반환)
-
-    실제발전량이 설비용량의 10% 이상인 시간대만 대상으로 한다.
-
-    - 단일 그룹: pred/actual은 1차원 array-like, capacity는 float
-    - 다중 그룹: pred/actual은 그룹별 컬럼을 가진 DataFrame,
-      capacity는 {컬럼명: 설비용량} 형태의 dict.
-      이 경우 그룹별 NMAE를 계산한 뒤 평균을 반환한다.
+def metric(answer_df: pd.DataFrame, pred_df: pd.DataFrame, target_cols=TARGET_COLS, capacity=CAPACITY_KWH):
     """
-    if isinstance(capacity, Mapping):
-        group_scores = [
-            _single_group_nmae(pred[col], actual[col], cap)
-            for col, cap in capacity.items()
-        ]
-        return float(np.mean(group_scores))
+    공식 평가 코드(codeshare 14035)를 그대로 이식한 함수.
+    answer_df, pred_df: TARGET_COLS 컬럼을 가진 DataFrame (같은 순서/길이여야 함)
 
-    return _single_group_nmae(pred, actual, capacity)
+    반환: (total_score, one_minus_nmae, ficr)
+    """
+    group_nmae = []
+    group_ficr = []
+
+    for col in target_cols:
+        actual = answer_df[col].to_numpy(dtype=float)
+        forecast = pred_df[col].to_numpy(dtype=float)
+        cap = capacity[col]
+
+        valid = actual >= cap * 0.10
+        actual = actual[valid]
+        forecast = forecast[valid]
+
+        if len(actual) == 0:
+            continue
+
+        error_rate = np.abs(forecast - actual) / cap
+        group_nmae.append(np.mean(error_rate))
+
+        unit_price = np.select(
+            [error_rate <= 0.06, error_rate <= 0.08],
+            [4.0, 3.0],
+            default=0.0,
+        )
+
+        earned_settlement = np.sum(actual * unit_price)
+        max_settlement = np.sum(actual * 4.0)
+        group_ficr.append(earned_settlement / max_settlement)
+
+    one_minus_nmae = 1 - np.mean(group_nmae)
+    ficr = np.mean(group_ficr)
+    total_score = 0.5 * one_minus_nmae + 0.5 * ficr
+
+    return total_score, one_minus_nmae, ficr
 
 
-def group_nmae_score(group_nmae_scores: Sequence[float]) -> float:
-    """KPX 3개 그룹의 NMAE 평균을 계산한다."""
-    return float(np.mean(group_nmae_scores))
+def error_rate_breakdown(answer_df: pd.DataFrame, pred_df: pd.DataFrame, target_cols=TARGET_COLS, capacity=CAPACITY_KWH) -> pd.DataFrame:
+    """
+    그룹별로 오차율 구간(<=6%, <=8%, >8%) 시간대 비율을 보여주는 진단용 함수.
+    FICR을 깎아먹는 '8% 초과' 구간이 얼마나 되는지 확인할 때 사용.
+    """
+    rows = []
+    for col in target_cols:
+        actual = answer_df[col].to_numpy(dtype=float)
+        forecast = pred_df[col].to_numpy(dtype=float)
+        cap = capacity[col]
+
+        valid = actual >= cap * 0.10
+        actual, forecast = actual[valid], forecast[valid]
+        if len(actual) == 0:
+            continue
+
+        error_rate = np.abs(forecast - actual) / cap
+        n = len(error_rate)
+        rows.append({
+            "group": col,
+            "평가대상_시간수": n,
+            "6%이하_비율": np.mean(error_rate <= 0.06),
+            "6~8%_비율": np.mean((error_rate > 0.06) & (error_rate <= 0.08)),
+            "8%초과_비율(정산금0)": np.mean(error_rate > 0.08),
+        })
+    return pd.DataFrame(rows)
 
 
-def ficr_score(*args, **kwargs) -> float:
-    # TODO: 시간대별 정산금 계단 구간표가 공개되면 해당 구간값을 기준으로 구현한다.
-    raise NotImplementedError("FICR 계단 구간표가 아직 공개되지 않아 미구현 상태입니다.")
+def bias_diagnosis(answer_df: pd.DataFrame, pred_df: pd.DataFrame, target_cols=TARGET_COLS, capacity=CAPACITY_KWH) -> pd.DataFrame:
+    """
+    편향(bias) 진단용 함수.
+    - 평균_편향률: (예측-실제)/설비용량의 평균. 0에 가까우면 편향 없음(무편향).
+      양수면 과대예측(발전량을 실제보다 높게 부르는 경향), 음수면 과소예측.
+    - 8%초과_시간_평균오차율: 8%를 넘는 시간대들만 모아서 평균 오차율이 얼마나 되는지.
+      이게 8~10% 정도로 문턱에 살짝 걸쳐있으면 '조금만 개선해도 문턱을 넘길 여지'가 크다는 뜻이고,
+      15% 이상으로 크면 단순 보정이 아니라 모델 자체를 개선해야 한다는 뜻.
+    """
+    rows = []
+    for col in target_cols:
+        actual = answer_df[col].to_numpy(dtype=float)
+        forecast = pred_df[col].to_numpy(dtype=float)
+        cap = capacity[col]
+
+        valid = actual >= cap * 0.10
+        actual, forecast = actual[valid], forecast[valid]
+        if len(actual) == 0:
+            continue
+
+        signed_error_rate = (forecast - actual) / cap
+        error_rate = np.abs(signed_error_rate)
+        over_mask = error_rate > 0.08
+
+        rows.append({
+            "group": col,
+            "평균_편향률(부호있음)": np.mean(signed_error_rate),
+            "편향_방향": "과대예측" if np.mean(signed_error_rate) > 0 else "과소예측",
+            "8%초과_시간_평균오차율": np.mean(error_rate[over_mask]) if over_mask.any() else np.nan,
+            "8%초과_시간_중앙값오차율": np.median(error_rate[over_mask]) if over_mask.any() else np.nan,
+        })
+    return pd.DataFrame(rows)
 
 
-def total_score(group_nmae_scores: Sequence[float], ficr: float) -> float:
-    """0.5 x (1 - NMAE) + 0.5 x FICR."""
-    one_minus_nmae = 1 - group_nmae_score(group_nmae_scores)
-    return 0.5 * one_minus_nmae + 0.5 * ficr
+# 하위호환: 기존 train_baseline.py가 import하던 이름 유지
+def nmae_score(pred: pd.DataFrame, actual: pd.DataFrame, capacity: dict = CAPACITY_KWH) -> float:
+    _, one_minus_nmae, _ = metric(actual, pred, target_cols=list(capacity.keys()), capacity=capacity)
+    return one_minus_nmae
+
+
+def total_score(pred: pd.DataFrame, actual: pd.DataFrame, capacity: dict = CAPACITY_KWH):
+    return metric(actual, pred, target_cols=list(capacity.keys()), capacity=capacity)

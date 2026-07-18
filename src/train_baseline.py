@@ -5,7 +5,10 @@ RandomForest 베이스라인 개선 버전.
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
      그룹 전용 날씨 피처를 구성 (info.xlsx 기반 그룹 좌표 계산)
   2. U/V 바람 성분을 풍속 크기 + 풍속^3 + 풍향(sin/cos)으로 변환 (파워커브 근사)
-  3. 제출 전에 시계열 holdout으로 로컬 1-NMAE를 계산해서 리더보드 제출 전 확인 가능
+  3. 공식 평가 산식(1-NMAE, FICR)으로 홀드아웃 검증 + 오차율/편향 진단 출력
+  4. v3: 홀드아웃 검증 결과 뚜렷한 '과소예측' 편향이 확인되어, 학습/보정(calib)/최종검증(holdout)
+     3구간으로 나누고 보정용 구간에서 선형 보정식(실제=a+b*예측)을 학습해 적용.
+     보정 전/후 Score를 같이 출력해서 실제로 개선되는지 검증함.
 
 실행:
     python src/train_baseline.py
@@ -17,6 +20,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
 
 from features import (
     TARGET_COLS,
@@ -28,7 +32,7 @@ from features import (
     aggregate_weather_for_group,
     calendar_features,
 )
-from evaluate import nmae_score
+from evaluate import metric, error_rate_breakdown, bias_diagnosis
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRAIN_DIR = DATA_DIR / "train"
@@ -37,6 +41,7 @@ SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submissions"
 
 N_NEAREST_GRIDS = 3       # 그룹 좌표에서 가장 가까운 격자 몇 개를 쓸지
 HOLDOUT_DAYS = 90         # 로컬 검증용 최근 N일을 holdout으로 분리 (시계열이므로 랜덤분할 금지)
+CALIB_DAYS = 60           # holdout 바로 이전 N일을 '보정식 학습용'으로 별도 분리 (holdout과 절대 겹치지 않음)
 
 
 def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: dict) -> dict:
@@ -94,10 +99,13 @@ def main():
     test_weather = build_group_weather(ldaps_test, gfs_test, group_coords)
 
     cutoff = train_labels["kst_dtm"].max() - pd.Timedelta(days=HOLDOUT_DAYS)
+    calib_start = cutoff - pd.Timedelta(days=CALIB_DAYS)
 
     predictions_test = pd.DataFrame({"forecast_kst_dtm": sample_submission["forecast_kst_dtm"]})
-    predictions_holdout = {}
+    predictions_holdout_raw = {}
+    predictions_holdout_calibrated = {}
     holdout_actual = {}
+    calibrators = {}
 
     for target in TARGET_COLS:
         weather = train_weather[target]
@@ -108,12 +116,18 @@ def main():
         mask_label = y_all.notna()
         X_all, y_all, dt_all = X_all[mask_label], y_all[mask_label], dt_all[mask_label]
 
+        # 3구간 분리: 학습 / 보정식 학습(calib) / 최종 검증(holdout) - 서로 절대 겹치지 않음
         is_holdout = dt_all > cutoff
-        X_tr, y_tr = X_all[~is_holdout], y_all[~is_holdout]
+        is_calib = (dt_all > calib_start) & (dt_all <= cutoff)
+        is_train = dt_all <= calib_start
+
+        X_tr, y_tr = X_all[is_train], y_all[is_train]
+        X_cal, y_cal = X_all[is_calib], y_all[is_calib]
         X_ho, y_ho = X_all[is_holdout], y_all[is_holdout]
 
         imputer = SimpleImputer(strategy="median")
         X_tr_imp = pd.DataFrame(imputer.fit_transform(X_tr), columns=X_tr.columns)
+        X_cal_imp = pd.DataFrame(imputer.transform(X_cal), columns=X_cal.columns)
         X_ho_imp = pd.DataFrame(imputer.transform(X_ho), columns=X_ho.columns)
 
         model = RandomForestRegressor(
@@ -126,24 +140,58 @@ def main():
         )
         model.fit(X_tr_imp, y_tr)
 
-        pred_ho = np.clip(model.predict(X_ho_imp), 0, CAPACITY_KWH[target])
-        predictions_holdout[target] = pred_ho
+        # calib 구간에서 '보정식' 학습: 실제값 = a + b * 모델예측값
+        pred_cal = model.predict(X_cal_imp)
+        calibrator = LinearRegression()
+        calibrator.fit(pred_cal.reshape(-1, 1), y_cal)
+        calibrators[target] = calibrator
+        print(f"[{target}] 보정식: 실제값 = {calibrator.intercept_:.1f} + {calibrator.coef_[0]:.4f} * 예측값")
+
+        # holdout에서 raw 예측 vs 보정 후 예측 둘 다 계산해서 개선 여부 확인
+        pred_ho_raw = np.clip(model.predict(X_ho_imp), 0, CAPACITY_KWH[target])
+        pred_ho_calibrated = np.clip(calibrator.predict(pred_ho_raw.reshape(-1, 1)), 0, CAPACITY_KWH[target])
+
+        predictions_holdout_raw[target] = pred_ho_raw
+        predictions_holdout_calibrated[target] = pred_ho_calibrated
         holdout_actual[target] = y_ho.values
 
-        X_all_imp = pd.DataFrame(imputer.fit_transform(X_all), columns=X_all.columns)
-        model.fit(X_all_imp, y_all)
+        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 재학습 후, 같은 보정식 적용
+        X_fit = pd.concat([X_tr, X_cal])
+        y_fit = pd.concat([y_tr, y_cal])
+        X_fit_imp = pd.DataFrame(imputer.fit_transform(X_fit), columns=X_fit.columns)
+        model.fit(X_fit_imp, y_fit)
 
         X_test = build_features(sample_submission[["forecast_id", "forecast_kst_dtm"]], test_weather[target], "forecast_kst_dtm")
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
-        pred_test = np.clip(model.predict(X_test_imp), 0, CAPACITY_KWH[target])
-        predictions_test[target] = pred_test
+        pred_test_raw = np.clip(model.predict(X_test_imp), 0, CAPACITY_KWH[target])
+        pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw.reshape(-1, 1)), 0, CAPACITY_KWH[target])
+        predictions_test[target] = pred_test_calibrated
 
-        print(f"[{target}] train={len(X_tr)}, holdout={len(X_ho)}")
+        print(f"[{target}] train={len(X_tr)}, calib={len(X_cal)}, holdout={len(X_ho)}")
 
-    pred_df = pd.DataFrame(predictions_holdout)
-    actual_df = pd.DataFrame(holdout_actual)
-    print("\n[로컬 검증 - holdout 구간 1-NMAE]")
-    print(nmae_score(pred_df, actual_df, CAPACITY_KWH))
+    # 그룹별 holdout 길이가 다를 수 있음(그룹3은 라벨 시작이 늦음).
+    # metric()은 컬럼(그룹)별로 독립 계산하므로, 길이가 짧은 그룹은 NaN으로 채워도
+    # 10% 미만 마스크에서 자동 제외되어 안전함 (데이터 손실 없이 정렬).
+    def to_df(d):
+        return pd.concat([pd.Series(v, name=k) for k, v in d.items()], axis=1)
+
+    actual_df = to_df(holdout_actual)
+    pred_df_raw = to_df(predictions_holdout_raw)
+    pred_df_calibrated = to_df(predictions_holdout_calibrated)
+
+    score_raw, nmae_raw, ficr_raw = metric(actual_df, pred_df_raw)
+    score_cal, nmae_cal, ficr_cal = metric(actual_df, pred_df_calibrated)
+
+    print("\n[보정 전 vs 보정 후 - holdout 구간, 공식 산식 기준]")
+    print(f"{'지표':<10}{'보정 전':>12}{'보정 후':>12}")
+    print(f"{'Score':<10}{score_raw:>12.4f}{score_cal:>12.4f}")
+    print(f"{'1-NMAE':<10}{nmae_raw:>12.4f}{nmae_cal:>12.4f}")
+    print(f"{'FICR':<10}{ficr_raw:>12.4f}{ficr_cal:>12.4f}")
+
+    print("\n[오차율 구간별 분포 - 보정 후]")
+    print(error_rate_breakdown(actual_df, pred_df_calibrated).to_string(index=False))
+    print("\n[편향 진단 - 보정 후]")
+    print(bias_diagnosis(actual_df, pred_df_calibrated).to_string(index=False))
 
     SUBMISSION_DIR.mkdir(exist_ok=True)
     submission = sample_submission[["forecast_id", "forecast_kst_dtm"]].copy()
@@ -151,7 +199,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v2_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v3_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

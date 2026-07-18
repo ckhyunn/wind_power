@@ -1,5 +1,5 @@
 """
-LightGBM 베이스라인 (v14).
+LightGBM+XGBoost 블렌딩 베이스라인 (v15).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -35,6 +35,12 @@ LightGBM 베이스라인 (v14).
   10. v14: SCADA 파워커브(물리 기반) 피처 추가. SCADA 실측 풍속은 예보 풍속과 스케일이
       안 맞아 직접 못 쓰므로(v9에서 확인), 대신 '예보 풍속(gfs_ws100_speed) -> 실제
       발전량'의 경험적 관계를 학습구간에서 isotonic으로 직접 적합해 강력한 단일 피처로 추가.
+      -> backtest.py로 검증(파워커브 유무 비교) 결과 평균 Score 사실상 동일, 성능 기여 없음
+         (LightGBM이 원본 풍속 피처만으로 이미 학습하고 있던 것으로 추정). 해롭지 않아 유지.
+  11. v15: 모델 학습 로직을 modeling.py로 공용화 (train_baseline.py/backtest.py가 반드시
+      같은 함수를 쓰도록 강제 - 파워커브 때 두 스크립트가 어긋났던 문제 재발 방지).
+      LightGBM 단독 앙상블에 XGBoost도 섞은 '모델 블렌딩'으로 확장. 서로 다른 알고리즘은
+      오차 패턴도 달라 시드 앙상블(v11)보다 분산 감소 효과가 클 것으로 기대.
 
 실행:
     python src/train_baseline.py
@@ -65,6 +71,7 @@ from features import (
     apply_power_curve,
 )
 from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile
+from modeling import train_blended_ensemble, ensemble_predict, refit_final_models, final_predict
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRAIN_DIR = DATA_DIR / "train"
@@ -210,40 +217,14 @@ def main():
         # v11: 두 가지 확정적 변경 (선택/탐색이 아니라 원칙에 기반한 결정이라 calib 과적합 위험 없음)
         #  1) objective를 기본값(L2, 제곱오차) 대신 'mae'(L1)로 고정.
         #     대회 평가지표(NMAE, FICR)가 전부 절대오차 기반이라 학습 목적함수를 일치시킴.
-        #  2) 시드 3개 앙상블. '고르기'가 아니라 '항상 평균'이라 과적합 위험이 없고
+        #  2) 시드 여러 개 앙상블. '고르기'가 아니라 '항상 평균'이라 과적합 위험이 없고
         #     분산을 줄여줌 (v8~v10에서 반복된 calib 과적합 패턴과는 성격이 다름).
-        SEEDS = [42, 123, 2024]
-        LGBM_PARAMS = dict(
-            n_estimators=2000,
-            learning_rate=0.03,
-            max_depth=7,
-            num_leaves=31,
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
-            objective="mae",
-            n_jobs=-1,
-            verbose=-1,
-        )
-
-        def ensemble_predict(models, X_imp):
-            preds = np.column_stack([m.predict(X_imp) for m in models])
-            return preds.mean(axis=1)
-
-        models = []
-        best_iterations = []
-        for seed in SEEDS:
-            m = lgb.LGBMRegressor(random_state=seed, **LGBM_PARAMS)
-            m.fit(
-                X_tr_imp, y_tr,
-                eval_set=[(X_cal_imp, y_cal)],
-                callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
-            )
-            models.append(m)
-            best_iterations.append(m.best_iteration_)
-        print(f"[{target}] 앙상블 {len(SEEDS)}개 시드, best_iteration={best_iterations}")
+        # v15: LightGBM 단독 앙상블에 XGBoost도 섞은 '모델 블렌딩'으로 확장 (modeling.py 참고).
+        #      train_baseline.py와 backtest.py가 반드시 같은 함수를 쓰도록 공용화함
+        #      (파워커브 피처 때 두 스크립트 로직이 어긋났던 사고 재발 방지).
+        trained = train_blended_ensemble(X_tr_imp, y_tr, X_cal_imp, y_cal)
+        models = trained  # 아래 최종 재학습 단계에서 재사용
+        print(f"[{target}] 앙상블 구성: " + ", ".join(f"{k}(seed={s},iter={bi})" for k, s, _, bi in trained))
 
         # calib 구간에서 '보정식' 학습.
         # v4에서 isotonic이 calib 데이터 부족으로 과적합해 오히려 성능이 나빠진 것을 확인했음.
@@ -291,24 +272,20 @@ def main():
         predictions_holdout_calibrated[target] = pred_ho_calibrated
         holdout_actual[target] = y_ho.values
 
-        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 시드별 재학습 후 같은 보정식 적용
-        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 각 시드에서 찾은 best_iteration을 그대로 사용
+        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 재학습 후 같은 보정식 적용
+        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 앞서 찾은 best_iteration을 그대로 사용
         X_fit = pd.concat([X_tr, X_cal])
         y_fit = pd.concat([y_tr, y_cal])
         X_fit_imp = pd.DataFrame(imputer.fit_transform(X_fit), columns=X_fit.columns)
 
-        final_models = []
-        for seed, best_iter in zip(SEEDS, best_iterations):
-            fm = lgb.LGBMRegressor(random_state=seed, **{**LGBM_PARAMS, "n_estimators": best_iter})
-            fm.fit(X_fit_imp, y_fit)
-            final_models.append(fm)
+        final_models = refit_final_models(trained, X_fit_imp, y_fit)
 
         X_test = build_features(sample_submission[["forecast_id", "forecast_kst_dtm"]], test_weather[target], "forecast_kst_dtm")
         X_test["power_curve_estimate"] = apply_power_curve(
             power_curve, fallback_ws, X_test[power_curve_col], CAPACITY_KWH[target]
         )
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
-        pred_test_raw = np.clip(ensemble_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
+        pred_test_raw = np.clip(final_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
         pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
         # v13에서 raw로 바꿔 실제 리더보드 테스트한 결과, 보정 버전(v11, 0.6146)이
         # raw(v13, 0.6073)보다 근소하게 나음. 백테스트는 반대였으나 차이(0.007)가 노이즈
@@ -349,7 +326,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v14_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v15_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

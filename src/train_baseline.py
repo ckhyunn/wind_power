@@ -1,5 +1,5 @@
 """
-LightGBM 베이스라인 (v12).
+LightGBM 베이스라인 (v11).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -29,14 +29,6 @@ LightGBM 베이스라인 (v12).
      - 시드 3개 앙상블 (평균): '고르기'가 아니라 '항상 평균'이라 과적합 위험 없이 분산 감소
      - 리드타임(lead_time_hours) 피처 추가
      - 최근접 격자 원본값(평균으로 뭉개지 않은 값)을 별도 피처로 추가
-     -> 실제 리더보드 제출 결과 로컬 대비 개선폭이 절반 정도로 줄어듦(로컬 +0.0088 vs
-        실제 +0.0007). v3~v11 아홉 번을 전부 같은 최근-90일 holdout으로 판단해온 게
-        누적되어 간접적 holdout 과적합이 생긴 것으로 추정.
-  10. v12: 위 문제 대응.
-      - holdout을 '최근 90일'에서 '1년 전 같은 시기(2023-10~2024-01)'로 이동. 지금까지
-        의사결정에 한 번도 쓰인 적 없는 신선한 구간. 계절성 비교 위해 정확히 365일 전으로.
-        (부수 효과: 최종 학습 데이터에 2024년 데이터가 전부 포함되어 오히려 더 커짐)
-      - 시드 앙상블 3개 -> 7개로 확장 (v11에서 효과 검증된 방향을 더 밀어붙임)
 
 실행:
     python src/train_baseline.py
@@ -72,13 +64,8 @@ TEST_DIR = DATA_DIR / "test"
 SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submissions"
 
 N_NEAREST_GRIDS = 3       # 그룹 좌표에서 가장 가까운 격자 몇 개를 쓸지
-HOLDOUT_DAYS = 90         # holdout 구간 길이 (시계열이므로 랜덤분할 금지)
-CALIB_DAYS = 60           # holdout 직전 N일을 '보정식 학습용'으로 별도 분리 (holdout과 절대 겹치지 않음)
-HOLDOUT_LOOKBACK_DAYS = 365  # v12: holdout을 '최근 90일'이 아니라 '1년 전 같은 시기'로 이동.
-                             # v3~v11 아홉 번의 의사결정을 전부 같은 최근-90일 holdout으로 판단해왔는데,
-                             # 실제 리더보드와의 격차가 버전이 갈수록 벌어지는 게 확인됨(간접적 holdout
-                             # 과적합). 한 번도 의사결정에 쓰인 적 없는 구간으로 옮겨 신선하게 재검증.
-                             # 계절성 비교 가능성을 위해 정확히 365일 전 같은 시기를 사용.
+HOLDOUT_DAYS = 90         # 로컬 검증용 최근 N일을 holdout으로 분리 (시계열이므로 랜덤분할 금지)
+CALIB_DAYS = 60           # holdout 바로 이전 N일을 '보정식 학습용'으로 별도 분리 (holdout과 절대 겹치지 않음)
 
 
 class _Reshape1DWrapper:
@@ -167,14 +154,8 @@ def main():
     train_weather = build_group_weather(ldaps_train, gfs_train, group_coords)
     test_weather = build_group_weather(ldaps_test, gfs_test, group_coords)
 
-    # v12: holdout을 '가장 최근 N일'이 아니라 '1년 전 같은 시기'로 이동 (아래 HOLDOUT_LOOKBACK_DAYS 설명 참고)
-    max_dt = train_labels["kst_dtm"].max()
-    holdout_end = max_dt - pd.Timedelta(days=HOLDOUT_LOOKBACK_DAYS)
-    holdout_start = holdout_end - pd.Timedelta(days=HOLDOUT_DAYS)
-    calib_end = holdout_start - pd.Timedelta(days=1)
-    calib_start = calib_end - pd.Timedelta(days=CALIB_DAYS)
-    print(f"holdout 구간: {holdout_start.date()} ~ {holdout_end.date()}  "
-          f"(calib: {calib_start.date()} ~ {calib_end.date()})")
+    cutoff = train_labels["kst_dtm"].max() - pd.Timedelta(days=HOLDOUT_DAYS)
+    calib_start = cutoff - pd.Timedelta(days=CALIB_DAYS)
 
     predictions_test = pd.DataFrame({"forecast_kst_dtm": sample_submission["forecast_kst_dtm"]})
     predictions_holdout_raw = {}
@@ -192,9 +173,9 @@ def main():
         X_all, y_all, dt_all = X_all[mask_label], y_all[mask_label], dt_all[mask_label]
 
         # 3구간 분리: 학습 / 보정식 학습(calib) / 최종 검증(holdout) - 서로 절대 겹치지 않음
-        is_holdout = (dt_all > holdout_start) & (dt_all <= holdout_end)
-        is_calib = (dt_all > calib_start) & (dt_all <= calib_end)
-        is_train = ~is_holdout & ~is_calib  # holdout/calib 구간을 제외한 나머지 전부 (앞뒤 모두 포함)
+        is_holdout = dt_all > cutoff
+        is_calib = (dt_all > calib_start) & (dt_all <= cutoff)
+        is_train = dt_all <= calib_start
 
         X_tr, y_tr = X_all[is_train], y_all[is_train]
         X_cal, y_cal = X_all[is_calib], y_all[is_calib]
@@ -210,7 +191,7 @@ def main():
         #     대회 평가지표(NMAE, FICR)가 전부 절대오차 기반이라 학습 목적함수를 일치시킴.
         #  2) 시드 3개 앙상블. '고르기'가 아니라 '항상 평균'이라 과적합 위험이 없고
         #     분산을 줄여줌 (v8~v10에서 반복된 calib 과적합 패턴과는 성격이 다름).
-        SEEDS = [42, 123, 2024, 7, 77, 777, 2025]  # v12: 3개 -> 7개로 확장 (앙상블 효과 검증됨)
+        SEEDS = [42, 123, 2024]
         LGBM_PARAMS = dict(
             n_estimators=2000,
             learning_rate=0.03,
@@ -341,7 +322,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v12_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v11_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

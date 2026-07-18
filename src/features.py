@@ -92,6 +92,14 @@ def nearest_grid_ids(weather_df: pd.DataFrame, target_lat: float, target_lon: fl
     return grids.nsmallest(k, "dist")["grid_id"].tolist()
 
 
+def nearest_grids_with_distance(weather_df: pd.DataFrame, target_lat: float, target_lon: float, k: int = 3) -> pd.DataFrame:
+    """weather_df에서 (target_lat, target_lon)에 가장 가까운 grid_id k개를, 거리(度 단위)와 함께 반환.
+    IDW(역거리가중) 집계에 사용."""
+    grids = weather_df[["grid_id", "latitude", "longitude"]].drop_duplicates()
+    grids["dist"] = np.sqrt((grids["latitude"] - target_lat) ** 2 + (grids["longitude"] - target_lon) ** 2)
+    return grids.nsmallest(k, "dist")[["grid_id", "dist"]].reset_index(drop=True)
+
+
 def add_wind_features(df: pd.DataFrame, u_col: str, v_col: str, prefix: str) -> pd.DataFrame:
     """U/V 성분 바람을 풍속 크기 + 풍향(sin/cos)으로 변환 (발전량은 물리적으로 풍속에 크게 의존)"""
     df = df.copy()
@@ -105,13 +113,47 @@ def add_wind_features(df: pd.DataFrame, u_col: str, v_col: str, prefix: str) -> 
 
 
 def aggregate_weather_for_group(df: pd.DataFrame, grid_ids: list, prefix: str) -> pd.DataFrame:
-    """지정된 grid_ids만 필터링해서 forecast_kst_dtm별 평균을 낸 그룹 전용 날씨 피처"""
+    """지정된 grid_ids만 필터링해서 forecast_kst_dtm별 단순평균을 낸 그룹 전용 날씨 피처.
+    (참고용으로 남겨둠 - IDW 도입 전 버전과 비교하고 싶을 때 사용)"""
     df = df[df["grid_id"].isin(grid_ids)].copy()
     df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
     drop_cols = {"data_available_kst_dtm", "grid_id", "latitude", "longitude"}
     value_cols = [c for c in df.columns if c not in {"forecast_kst_dtm", *drop_cols}]
     agg = df.groupby("forecast_kst_dtm")[value_cols].mean()
     agg.columns = [f"{prefix}_{c}_mean" for c in agg.columns]
+    return agg.reset_index()
+
+
+def aggregate_weather_idw(df: pd.DataFrame, grid_dist: pd.DataFrame, prefix: str, power: float = 2.0) -> pd.DataFrame:
+    """
+    거리 가중 평균(IDW, Inverse Distance Weighting)으로 그룹 전용 날씨 피처를 만듦.
+    가까운 격자일수록 가중치가 커짐: weight = 1 / distance^power
+
+    grid_dist: nearest_grids_with_distance()의 결과 (grid_id, dist 컬럼)
+    power: 거리 감쇠 강도. 2.0이 일반적인 기본값 (거리 2배면 가중치 1/4)
+    """
+    grid_ids = grid_dist["grid_id"].tolist()
+    dist_map = dict(zip(grid_dist["grid_id"], grid_dist["dist"]))
+
+    df = df[df["grid_id"].isin(grid_ids)].copy()
+    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
+
+    # 거리 0(격자가 정확히 좌표와 일치)인 경우를 대비해 아주 작은 값으로 하한 처리
+    eps = 1e-6
+    df["_weight"] = df["grid_id"].map(dist_map).clip(lower=eps).pow(-power)
+
+    drop_cols = {"data_available_kst_dtm", "grid_id", "latitude", "longitude", "_weight"}
+    value_cols = [c for c in df.columns if c not in {"forecast_kst_dtm", *drop_cols}]
+
+    # 가중평균 = sum(value * weight) / sum(weight), forecast_kst_dtm별로 계산
+    weighted = df[value_cols].multiply(df["_weight"], axis=0)
+    weighted["forecast_kst_dtm"] = df["forecast_kst_dtm"]
+    weighted["_weight"] = df["_weight"]
+
+    grouped = weighted.groupby("forecast_kst_dtm")
+    weight_sum = grouped["_weight"].sum()
+    agg = grouped[value_cols].sum().div(weight_sum, axis=0)
+    agg.columns = [f"{prefix}_{c}_idw" for c in agg.columns]
     return agg.reset_index()
 
 

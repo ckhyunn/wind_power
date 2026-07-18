@@ -9,18 +9,14 @@ Score = 0.5 x (1 - NMAE) + 0.5 x FICR
   아직 구간값이 공개되지 않아 미구현 상태로 남겨둔다.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
 CAPACITY_THRESHOLD_RATIO = 0.1
 
 
-def nmae_score(pred: np.ndarray, actual: np.ndarray, capacity: float) -> float:
-    """단일 그룹의 NMAE를 계산한다.
-
-    실제발전량이 설비용량(capacity)의 10% 이상인 시간대만 대상으로 한다.
-    """
+def _single_group_nmae(pred: np.ndarray, actual: np.ndarray, capacity: float) -> float:
     pred = np.asarray(pred, dtype=float)
     actual = np.asarray(actual, dtype=float)
 
@@ -29,6 +25,26 @@ def nmae_score(pred: np.ndarray, actual: np.ndarray, capacity: float) -> float:
         return 0.0
 
     return float(np.mean(np.abs(pred[mask] - actual[mask]) / capacity))
+
+
+def nmae_score(pred, actual, capacity) -> float:
+    """NMAE를 계산한다. (값이 작을수록 좋음, 1-NMAE가 아니라 NMAE 자체를 반환)
+
+    실제발전량이 설비용량의 10% 이상인 시간대만 대상으로 한다.
+
+    - 단일 그룹: pred/actual은 1차원 array-like, capacity는 float
+    - 다중 그룹: pred/actual은 그룹별 컬럼을 가진 DataFrame,
+      capacity는 {컬럼명: 설비용량} 형태의 dict.
+      이 경우 그룹별 NMAE를 계산한 뒤 평균을 반환한다.
+    """
+    if isinstance(capacity, Mapping):
+        group_scores = [
+            _single_group_nmae(pred[col], actual[col], cap)
+            for col, cap in capacity.items()
+        ]
+        return float(np.mean(group_scores))
+
+    return _single_group_nmae(pred, actual, capacity)
 
 
 def group_nmae_score(group_nmae_scores: Sequence[float]) -> float:

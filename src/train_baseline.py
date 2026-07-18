@@ -1,5 +1,5 @@
 """
-RandomForest 베이스라인 개선 버전.
+LightGBM 베이스라인 (v7).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -16,6 +16,11 @@ RandomForest 베이스라인 개선 버전.
   6. v5: calib 구간을 다시 반으로 나눠(calib_fit/calib_val) 선형/isotonic을 둘 다 학습해보고
      calib_val(둘 다 안 본 데이터)에서 더 나은 쪽을 그룹별로 자동 선택. 데이터가 충분치 않을 때
      isotonic이 과적합하는 문제를 자동으로 회피.
+  7. v6: 근소한 차이(노이즈)로 isotonic이 선택되는 것을 막기 위해 5% 마진 추가.
+  8. v7: 보정(후처리)만으로는 Score가 0.58~0.62 사이에서 정체됨을 확인.
+     -> RandomForest를 LightGBM으로 교체 (부스팅 계열은 극단값을 평균으로 당기는 경향이 적어
+        RandomForest 특유의 과소예측 편향 자체를 줄이는 효과를 기대). calib을 조기종료
+        검증셋으로 사용해 과적합 방지.
 
 실행:
     python src/train_baseline.py
@@ -25,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+import lightgbm as lgb
 from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LinearRegression
@@ -149,15 +154,28 @@ def main():
         X_cal_imp = pd.DataFrame(imputer.transform(X_cal), columns=X_cal.columns)
         X_ho_imp = pd.DataFrame(imputer.transform(X_ho), columns=X_ho.columns)
 
-        model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=16,
-            min_samples_leaf=6,
-            max_features="sqrt",
+        model = lgb.LGBMRegressor(
+            n_estimators=2000,
+            learning_rate=0.03,
+            max_depth=7,
+            num_leaves=31,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
             random_state=42,
             n_jobs=-1,
+            verbose=-1,
         )
-        model.fit(X_tr_imp, y_tr)
+        # calib을 조기종료 검증셋으로 사용 (holdout은 절대 학습/조기종료에 쓰지 않음)
+        model.fit(
+            X_tr_imp, y_tr,
+            eval_set=[(X_cal_imp, y_cal)],
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+        )
+        best_iteration = model.best_iteration_
+        print(f"[{target}] LightGBM 조기종료 - best_iteration={best_iteration}")
 
         # calib 구간에서 '보정식' 학습.
         # v4에서 isotonic이 calib 데이터 부족으로 과적합해 오히려 성능이 나빠진 것을 확인했음.
@@ -206,6 +224,8 @@ def main():
         holdout_actual[target] = y_ho.values
 
         # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 재학습 후, 같은 보정식 적용
+        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 앞서 찾은 best_iteration을 그대로 사용
+        model.set_params(n_estimators=best_iteration)
         X_fit = pd.concat([X_tr, X_cal])
         y_fit = pd.concat([y_tr, y_cal])
         X_fit_imp = pd.DataFrame(imputer.fit_transform(X_fit), columns=X_fit.columns)
@@ -251,7 +271,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v6_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v7_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

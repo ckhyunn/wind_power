@@ -1,5 +1,5 @@
 """
-LightGBM+XGBoost 블렌딩 베이스라인 (v15).
+LightGBM+XGBoost 블렌딩 베이스라인 (v17).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -41,6 +41,18 @@ LightGBM+XGBoost 블렌딩 베이스라인 (v15).
       같은 함수를 쓰도록 강제 - 파워커브 때 두 스크립트가 어긋났던 문제 재발 방지).
       LightGBM 단독 앙상블에 XGBoost도 섞은 '모델 블렌딩'으로 확장. 서로 다른 알고리즘은
       오차 패턴도 달라 시드 앙상블(v11)보다 분산 감소 효과가 클 것으로 기대.
+      (v16: SCADA 2단계 물리 피처(예보풍속->실측풍속 환산->진짜 파워커브) 추가.
+       diagnose_vestas.py로 VESTAS 이상치를 걷어내고 만든 피처. holdout에서는 최고치였지만
+       backtest 5윈도우 평균은 v15와 완전히 동일 -> 유효한 개선 아님으로 결론)
+      v8~v16까지 9번의 서로 다른 시도(격자집계/컷아웃/하이퍼파라미터/파워커브/모델블렌딩/
+      SCADA물리피처)가 전부 backtest 평균 0.586~0.592 근처에서 정체. '이미 있는 정보를
+      모델이 더 잘 쓰게 돕는' 접근은 한계에 도달한 것으로 진단, 방향 전환.
+  12. v17: 지금까지 안 써본 새로운 정보를 추가.
+      - 공기밀도(온도+기압, 이상기체법칙) - 같은 풍속이라도 밀도 높은 겨울 공기가 더 많은
+        운동에너지를 전달하는데 이 정보가 지금까지 전혀 없었음
+      - 윈드시어(100m-10m 풍속차) - 대기 안정도/난류 강도의 대리지표
+      - 인접 시간대(전/후 1시간) 풍속 - 지금까지 매 시간을 독립적으로 취급했는데, 처음으로
+        시간적 흐름 정보를 제공 (같은 예보 배치 안이라 데이터 누수 아님)
 
 실행:
     python src/train_baseline.py
@@ -66,6 +78,9 @@ from features import (
     aggregate_weather_for_group,
     lead_time_feature,
     nearest_grid_raw_features,
+    add_air_density_feature,
+    add_wind_shear_feature,
+    add_lag_lead_features,
     calendar_features,
     fit_power_curve,
     apply_power_curve,
@@ -138,6 +153,22 @@ def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: di
         weather = add_wind_features(
             weather, "gfs_nearest1_heightAboveGround_100_100u", "gfs_nearest1_heightAboveGround_100_100v", "gfs_nearest1_ws100"
         )
+
+        # v17: 공기밀도 (온도+기압, 이상기체 법칙) - 같은 풍속이라도 밀도 높은 겨울 공기가
+        # 더 많은 운동에너지를 전달함. 지금까지 풍속 위주 피처에는 없던 정보.
+        weather = add_air_density_feature(
+            weather, "ldaps_heightAboveGround_2_t_mean", "ldaps_surface_0_sp_mean", "ldaps"
+        )
+        weather = add_air_density_feature(
+            weather, "gfs_heightAboveGround_2_2t_mean", "gfs_surface_0_sp_mean", "gfs"
+        )
+
+        # v17: 윈드시어 (고도별 풍속 차이) - 대기 안정도/난류 강도의 대리지표
+        weather = add_wind_shear_feature(weather, "gfs_ws10_speed", "gfs_ws100_speed", "gfs")
+
+        # v17: 인접 시간대(전/후 1시간) 풍속 - 지금까지 매 시간을 독립적으로 취급했는데,
+        # 처음으로 시간적 흐름(급변/돌풍 여부) 정보를 제공
+        weather = add_lag_lead_features(weather, ["gfs_ws100_speed", "ldaps_ws10_speed"])
 
         group_weather[group] = weather
     return group_weather
@@ -326,7 +357,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v15_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v17_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

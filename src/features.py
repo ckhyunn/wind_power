@@ -113,6 +113,49 @@ def add_wind_features(df: pd.DataFrame, u_col: str, v_col: str, prefix: str) -> 
     return df
 
 
+AIR_GAS_CONSTANT = 287.05  # J/(kg*K), 건조공기 기체상수
+
+
+def add_air_density_feature(df: pd.DataFrame, temp_col: str, pressure_col: str, prefix: str) -> pd.DataFrame:
+    """
+    이상기체 법칙으로 공기밀도 계산: rho = P / (R * T)
+    온도는 Kelvin, 기압은 Pa 단위여야 함 (GFS/LDAPS 원본 데이터 확인 결과 두 단위 모두 해당).
+
+    발전량은 물리적으로 공기밀도에도 비례함 (같은 풍속이라도 겨울철 밀도 높은 공기가
+    더 많은 운동에너지를 전달) - 지금까지 풍속 위주 피처에는 없던 정보.
+    """
+    df = df.copy()
+    df[f"{prefix}_air_density"] = df[pressure_col] / (AIR_GAS_CONSTANT * df[temp_col])
+    return df
+
+
+def add_wind_shear_feature(df: pd.DataFrame, ws_low_col: str, ws_high_col: str, prefix: str) -> pd.DataFrame:
+    """
+    고도별 풍속 차이(윈드시어) = 고고도 풍속 - 저고도 풍속.
+    대기 안정도/난류 강도의 대리지표. 시어가 크면 대기가 불안정(난류 심함)해서
+    터빈이 겪는 실제 바람이 예보 평균값과 더 크게 어긋날 가능성이 있음.
+    """
+    df = df.copy()
+    df[f"{prefix}_wind_shear"] = df[ws_high_col] - df[ws_low_col]
+    return df
+
+
+def add_lag_lead_features(weather: pd.DataFrame, cols: list, dt_col: str = "forecast_kst_dtm") -> pd.DataFrame:
+    """
+    인접 시간대(전/후 1시간) 값을 피처로 추가.
+    기상예보는 하루치(24시간)가 한 번에 발표되므로, 특정 시각을 예측할 때 그 앞뒤 시간대
+    예보값을 아는 것은 데이터 누수가 아님 (전부 같은 시점에 이미 확보된 예보 정보).
+    지금까지 모델은 매 시간을 독립적으로 취급했는데, 이 피처로 시간적 흐름(급변 여부 등)
+    정보를 처음으로 제공함.
+    """
+    weather = weather.sort_values(dt_col).reset_index(drop=True)
+    for col in cols:
+        weather[f"{col}_lag1"] = weather[col].shift(1)
+        weather[f"{col}_lead1"] = weather[col].shift(-1)
+        weather[f"{col}_diff1"] = weather[col] - weather[f"{col}_lag1"]  # 시간당 변화율 (급변/돌풍 대리지표)
+    return weather
+
+
 def aggregate_weather_for_group(df: pd.DataFrame, grid_ids: list, prefix: str) -> pd.DataFrame:
     """지정된 grid_ids만 필터링해서 forecast_kst_dtm별 단순평균을 낸 그룹 전용 날씨 피처.
     (참고용으로 남겨둠 - IDW 도입 전 버전과 비교하고 싶을 때 사용)"""

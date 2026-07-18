@@ -9,6 +9,13 @@ RandomForest 베이스라인 개선 버전.
   4. v3: 홀드아웃 검증 결과 뚜렷한 '과소예측' 편향이 확인되어, 학습/보정(calib)/최종검증(holdout)
      3구간으로 나누고 보정용 구간에서 선형 보정식(실제=a+b*예측)을 학습해 적용.
      보정 전/후 Score를 같이 출력해서 실제로 개선되는지 검증함.
+  5. v4: 예측값 구간별 편향 진단 결과, 편향의 크기/부호가 구간마다 달라(중간 구간이 가장 심함,
+     일부 그룹은 고발전 구간에서 부호까지 반전) 선형 보정의 한계가 확인됨.
+     -> IsotonicRegression(단조 비선형 보정)으로 교체했으나, calib 데이터(약 1,440시간)가
+        부족해 오히려 과적합되어 v3보다 성능이 떨어짐을 확인.
+  6. v5: calib 구간을 다시 반으로 나눠(calib_fit/calib_val) 선형/isotonic을 둘 다 학습해보고
+     calib_val(둘 다 안 본 데이터)에서 더 나은 쪽을 그룹별로 자동 선택. 데이터가 충분치 않을 때
+     isotonic이 과적합하는 문제를 자동으로 회피.
 
 실행:
     python src/train_baseline.py
@@ -20,6 +27,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LinearRegression
 
 from features import (
@@ -32,7 +40,7 @@ from features import (
     aggregate_weather_for_group,
     calendar_features,
 )
-from evaluate import metric, error_rate_breakdown, bias_diagnosis
+from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRAIN_DIR = DATA_DIR / "train"
@@ -42,6 +50,17 @@ SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submissions"
 N_NEAREST_GRIDS = 3       # 그룹 좌표에서 가장 가까운 격자 몇 개를 쓸지
 HOLDOUT_DAYS = 90         # 로컬 검증용 최근 N일을 holdout으로 분리 (시계열이므로 랜덤분할 금지)
 CALIB_DAYS = 60           # holdout 바로 이전 N일을 '보정식 학습용'으로 별도 분리 (holdout과 절대 겹치지 않음)
+
+
+class _Reshape1DWrapper:
+    """LinearRegression은 2D 입력을 요구하는데, IsotonicRegression은 1D를 요구함.
+    호출부에서 매번 분기하지 않도록 1D predict 인터페이스로 감싸는 얇은 wrapper."""
+
+    def __init__(self, fitted_linear_model):
+        self._model = fitted_linear_model
+
+    def predict(self, x_1d):
+        return self._model.predict(np.asarray(x_1d).reshape(-1, 1))
 
 
 def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: dict) -> dict:
@@ -140,16 +159,47 @@ def main():
         )
         model.fit(X_tr_imp, y_tr)
 
-        # calib 구간에서 '보정식' 학습: 실제값 = a + b * 모델예측값
+        # calib 구간에서 '보정식' 학습.
+        # v4에서 isotonic이 calib 데이터 부족으로 과적합해 오히려 성능이 나빠진 것을 확인했음.
+        # -> calib을 다시 앞/뒤로 나눠(calib_fit/calib_val), 선형과 isotonic 둘 다 calib_fit으로
+        #    학습한 뒤 calib_val(둘 다 안 본 데이터)에서 어느 쪽이 더 나은지 비교해서 자동 선택.
+        #    선택된 방식은 calib 전체(calib_fit+calib_val)로 다시 학습해서 최종 사용.
         pred_cal = model.predict(X_cal_imp)
-        calibrator = LinearRegression()
-        calibrator.fit(pred_cal.reshape(-1, 1), y_cal)
+        n_cal = len(pred_cal)
+        split = n_cal // 2
+        pred_cal_fit, pred_cal_val = pred_cal[:split], pred_cal[split:]
+        y_cal_fit, y_cal_val = y_cal.values[:split], y_cal.values[split:]
+
+        def calib_error(calib_model) -> float:
+            pred_val = np.clip(calib_model.predict(pred_cal_val), 0, CAPACITY_KWH[target])
+            return np.mean(np.abs(pred_val - y_cal_val)) / CAPACITY_KWH[target]
+
+        linear_probe = LinearRegression()
+        linear_probe.fit(pred_cal_fit.reshape(-1, 1), y_cal_fit)
+        linear_probe_wrapped = _Reshape1DWrapper(linear_probe)
+        linear_err = calib_error(linear_probe_wrapped)
+
+        isotonic_probe = IsotonicRegression(out_of_bounds="clip", increasing=True)
+        isotonic_probe.fit(pred_cal_fit, y_cal_fit)
+        isotonic_err = calib_error(isotonic_probe)
+
+        # v5: 근소한 차이(예: 0.0537 vs 0.0543)로 isotonic이 선택되면 노이즈에 취약함.
+        # -> isotonic이 linear보다 최소 SWITCH_MARGIN(상대 개선폭) 이상 확실히 나을 때만 전환.
+        #    애매하면 더 단순하고 안정적인 linear를 기본값으로 유지.
+        SWITCH_MARGIN = 0.05  # isotonic이 linear보다 5% 이상 더 낮은 오차를 보여야 전환
+        if isotonic_err < linear_err * (1 - SWITCH_MARGIN):
+            chosen = "isotonic"
+            calibrator = IsotonicRegression(out_of_bounds="clip", increasing=True).fit(pred_cal, y_cal)
+        else:
+            chosen = "linear"
+            calibrator = _Reshape1DWrapper(LinearRegression().fit(pred_cal.reshape(-1, 1), y_cal))
+
         calibrators[target] = calibrator
-        print(f"[{target}] 보정식: 실제값 = {calibrator.intercept_:.1f} + {calibrator.coef_[0]:.4f} * 예측값")
+        print(f"[{target}] 보정 방식 선택: {chosen} (calib_val 오차율 - linear={linear_err:.4f}, isotonic={isotonic_err:.4f})")
 
         # holdout에서 raw 예측 vs 보정 후 예측 둘 다 계산해서 개선 여부 확인
         pred_ho_raw = np.clip(model.predict(X_ho_imp), 0, CAPACITY_KWH[target])
-        pred_ho_calibrated = np.clip(calibrator.predict(pred_ho_raw.reshape(-1, 1)), 0, CAPACITY_KWH[target])
+        pred_ho_calibrated = np.clip(calibrator.predict(pred_ho_raw), 0, CAPACITY_KWH[target])
 
         predictions_holdout_raw[target] = pred_ho_raw
         predictions_holdout_calibrated[target] = pred_ho_calibrated
@@ -164,7 +214,7 @@ def main():
         X_test = build_features(sample_submission[["forecast_id", "forecast_kst_dtm"]], test_weather[target], "forecast_kst_dtm")
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
         pred_test_raw = np.clip(model.predict(X_test_imp), 0, CAPACITY_KWH[target])
-        pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw.reshape(-1, 1)), 0, CAPACITY_KWH[target])
+        pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
         predictions_test[target] = pred_test_calibrated
 
         print(f"[{target}] train={len(X_tr)}, calib={len(X_cal)}, holdout={len(X_ho)}")
@@ -192,6 +242,8 @@ def main():
     print(error_rate_breakdown(actual_df, pred_df_calibrated).to_string(index=False))
     print("\n[편향 진단 - 보정 후]")
     print(bias_diagnosis(actual_df, pred_df_calibrated).to_string(index=False))
+    print("\n[예측값 구간별(quantile) 편향 - 보정 후, 선형 보정이 구간별로도 고르게 먹혔는지 확인]")
+    print(bias_by_prediction_quantile(actual_df, pred_df_calibrated).to_string(index=False))
 
     SUBMISSION_DIR.mkdir(exist_ok=True)
     submission = sample_submission[["forecast_id", "forecast_kst_dtm"]].copy()
@@ -199,7 +251,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v3_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v6_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

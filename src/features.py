@@ -140,6 +140,18 @@ def add_wind_shear_feature(df: pd.DataFrame, ws_low_col: str, ws_high_col: str, 
     return df
 
 
+def add_air_power_density_feature(df: pd.DataFrame, density_col: str, speed_cubed_col: str, prefix: str) -> pd.DataFrame:
+    """
+    풍력 발전의 물리 공식 그대로: 이론상 발전 가능 출력 ∝ 공기밀도 x 풍속^3.
+    지금까지 공기밀도(add_air_density_feature)와 풍속^3(add_wind_features)을
+    각각 별도 피처로만 넣었는데, 실제 물리식은 이 둘의 '곱'이라 상호작용항을
+    명시적으로 만들어주면 트리 모델이 이 관계를 더 쉽게 학습할 수 있음.
+    """
+    df = df.copy()
+    df[f"{prefix}_air_power_density"] = df[density_col] * df[speed_cubed_col]
+    return df
+
+
 def add_lag_lead_features(weather: pd.DataFrame, cols: list, dt_col: str = "forecast_kst_dtm") -> pd.DataFrame:
     """
     인접 시간대(전/후 1시간) 값을 피처로 추가.

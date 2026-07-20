@@ -1,5 +1,5 @@
 """
-LightGBM+XGBoost 블렌딩 베이스라인 (v20).
+LightGBM 베이스라인 (v11).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -29,30 +29,6 @@ LightGBM+XGBoost 블렌딩 베이스라인 (v20).
      - 시드 3개 앙상블 (평균): '고르기'가 아니라 '항상 평균'이라 과적합 위험 없이 분산 감소
      - 리드타임(lead_time_hours) 피처 추가
      - 최근접 격자 원본값(평균으로 뭉개지 않은 값)을 별도 피처로 추가
-     (v12: holdout을 1년 전 구간으로 이동 + 시드 7개 확장 -> 실제 리더보드 하락, 미채택)
-     (backtest.py: 5개 시기 평균 검증 인프라 구축. raw vs 보정 실제 비교 결과 차이가
-      0.007 수준 노이즈로 확인되어 보정 있는 v11 방식 유지)
-  10. v14: SCADA 파워커브(물리 기반) 피처 추가. SCADA 실측 풍속은 예보 풍속과 스케일이
-      안 맞아 직접 못 쓰므로(v9에서 확인), 대신 '예보 풍속(gfs_ws100_speed) -> 실제
-      발전량'의 경험적 관계를 학습구간에서 isotonic으로 직접 적합해 강력한 단일 피처로 추가.
-      -> backtest.py로 검증(파워커브 유무 비교) 결과 평균 Score 사실상 동일, 성능 기여 없음
-         (LightGBM이 원본 풍속 피처만으로 이미 학습하고 있던 것으로 추정). 해롭지 않아 유지.
-  11. v15: 모델 학습 로직을 modeling.py로 공용화 (train_baseline.py/backtest.py가 반드시
-      같은 함수를 쓰도록 강제 - 파워커브 때 두 스크립트가 어긋났던 문제 재발 방지).
-      LightGBM 단독 앙상블에 XGBoost도 섞은 '모델 블렌딩'으로 확장. 서로 다른 알고리즘은
-      오차 패턴도 달라 시드 앙상블(v11)보다 분산 감소 효과가 클 것으로 기대.
-      (v16: SCADA 2단계 물리 피처(예보풍속->실측풍속 환산->진짜 파워커브) 추가.
-       diagnose_vestas.py로 VESTAS 이상치를 걷어내고 만든 피처. holdout에서는 최고치였지만
-       backtest 5윈도우 평균은 v15와 완전히 동일 -> 유효한 개선 아님으로 결론)
-      v8~v16까지 9번의 서로 다른 시도(격자집계/컷아웃/하이퍼파라미터/파워커브/모델블렌딩/
-      SCADA물리피처)가 전부 backtest 평균 0.586~0.592 근처에서 정체. '이미 있는 정보를
-      모델이 더 잘 쓰게 돕는' 접근은 한계에 도달한 것으로 진단, 방향 전환.
-  12. v17: 지금까지 안 써본 새로운 정보를 추가.
-      - 공기밀도(온도+기압, 이상기체법칙) - 같은 풍속이라도 밀도 높은 겨울 공기가 더 많은
-        운동에너지를 전달하는데 이 정보가 지금까지 전혀 없었음
-      - 윈드시어(100m-10m 풍속차) - 대기 안정도/난류 강도의 대리지표
-      - 인접 시간대(전/후 1시간) 풍속 - 지금까지 매 시간을 독립적으로 취급했는데, 처음으로
-        시간적 흐름 정보를 제공 (같은 예보 배치 안이라 데이터 누수 아님)
 
 실행:
     python src/train_baseline.py
@@ -76,18 +52,11 @@ from features import (
     nearest_grids_with_distance,
     add_wind_features,
     aggregate_weather_for_group,
-    aggregate_weather_dispersion,
     lead_time_feature,
     nearest_grid_raw_features,
-    add_air_density_feature,
-    add_wind_shear_feature,
-    add_lag_lead_features,
     calendar_features,
-    fit_power_curve,
-    apply_power_curve,
 )
 from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile
-from modeling import train_blended_ensemble, ensemble_predict, refit_final_models, final_predict
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRAIN_DIR = DATA_DIR / "train"
@@ -96,7 +65,6 @@ SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submissions"
 
 N_NEAREST_GRIDS = 3       # 그룹 좌표에서 가장 가까운 격자 몇 개를 쓸지
 HOLDOUT_DAYS = 90         # 로컬 검증용 최근 N일을 holdout으로 분리 (시계열이므로 랜덤분할 금지)
-USE_LOG_TARGET = True     # v20: 발전량을 log1p 변환해서 학습 (저출력 구간 상대오차에 더 민감하게)
 CALIB_DAYS = 60           # holdout 바로 이전 N일을 '보정식 학습용'으로 별도 분리 (holdout과 절대 겹치지 않음)
 
 
@@ -156,35 +124,6 @@ def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: di
             weather, "gfs_nearest1_heightAboveGround_100_100u", "gfs_nearest1_heightAboveGround_100_100v", "gfs_nearest1_ws100"
         )
 
-        # v17: 공기밀도 (온도+기압, 이상기체 법칙) - 같은 풍속이라도 밀도 높은 겨울 공기가
-        # 더 많은 운동에너지를 전달함. 지금까지 풍속 위주 피처에는 없던 정보.
-        weather = add_air_density_feature(
-            weather, "ldaps_heightAboveGround_2_t_mean", "ldaps_surface_0_sp_mean", "ldaps"
-        )
-        weather = add_air_density_feature(
-            weather, "gfs_heightAboveGround_2_2t_mean", "gfs_surface_0_sp_mean", "gfs"
-        )
-
-        # v17: 윈드시어 (고도별 풍속 차이) - 대기 안정도/난류 강도의 대리지표
-        weather = add_wind_shear_feature(weather, "gfs_ws10_speed", "gfs_ws100_speed", "gfs")
-
-        # v17: 인접 시간대(전/후 1시간) 풍속 - 지금까지 매 시간을 독립적으로 취급했는데,
-        # 처음으로 시간적 흐름(급변/돌풍 여부) 정보를 제공
-        weather = add_lag_lead_features(weather, ["gfs_ws100_speed", "ldaps_ws10_speed"])
-
-        # v18: 격자 간 분산(불확실성) 피처. 지금까지 최근접 격자들을 평균으로만 썼는데,
-        # 격자 간 편차가 크다는 건 그 시간대 예보 자체가 불확실하거나 국지적으로
-        # 변동성이 큰 상황이라는 신호. 완전히 새로운 종류의 정보.
-        ldaps_disp = aggregate_weather_dispersion(
-            ldaps, ldaps_grids, ["heightAboveGround_10_10u", "heightAboveGround_10_10v"], "ldaps"
-        )
-        gfs_disp = aggregate_weather_dispersion(
-            gfs, gfs_grids, ["heightAboveGround_10_10u", "heightAboveGround_10_10v",
-                              "heightAboveGround_100_100u", "heightAboveGround_100_100v"], "gfs"
-        )
-        weather = weather.merge(ldaps_disp, on="forecast_kst_dtm", how="left")
-        weather = weather.merge(gfs_disp, on="forecast_kst_dtm", how="left")
-
         group_weather[group] = weather
     return group_weather
 
@@ -238,19 +177,6 @@ def main():
         is_calib = (dt_all > calib_start) & (dt_all <= cutoff)
         is_train = dt_all <= calib_start
 
-        # v14: 파워커브(물리 기반) 피처.
-        # SCADA 실측 풍속을 직접 쓰면 예보 풍속과 스케일이 안 맞는 문제가 있었음(v9에서 확인).
-        # 대신 '예보 풍속(gfs_ws100_speed) -> 실제 그룹 발전량'의 경험적 관계를 학습구간에서
-        # 직접 적합(isotonic, 단조증가)해서, "이 예보 풍속이면 과거엔 보통 이 정도 발전했다"는
-        # 강력한 단일 피처를 추가. LightGBM이 이걸 기준점 삼아 나머지 오차만 보정하면 되므로
-        # 학습이 쉬워질 것으로 기대. SCADA를 직접 쓰지 않아 스케일 불일치 문제를 우회함.
-        # (fit_power_curve/apply_power_curve는 features.py 공용 함수 - backtest.py도 동일하게 사용)
-        power_curve_col = "gfs_ws100_speed"
-        power_curve, fallback_ws = fit_power_curve(X_all.loc[is_train, power_curve_col], y_all[is_train])
-        X_all["power_curve_estimate"] = apply_power_curve(
-            power_curve, fallback_ws, X_all[power_curve_col], CAPACITY_KWH[target]
-        )
-
         X_tr, y_tr = X_all[is_train], y_all[is_train]
         X_cal, y_cal = X_all[is_calib], y_all[is_calib]
         X_ho, y_ho = X_all[is_holdout], y_all[is_holdout]
@@ -263,14 +189,40 @@ def main():
         # v11: 두 가지 확정적 변경 (선택/탐색이 아니라 원칙에 기반한 결정이라 calib 과적합 위험 없음)
         #  1) objective를 기본값(L2, 제곱오차) 대신 'mae'(L1)로 고정.
         #     대회 평가지표(NMAE, FICR)가 전부 절대오차 기반이라 학습 목적함수를 일치시킴.
-        #  2) 시드 여러 개 앙상블. '고르기'가 아니라 '항상 평균'이라 과적합 위험이 없고
+        #  2) 시드 3개 앙상블. '고르기'가 아니라 '항상 평균'이라 과적합 위험이 없고
         #     분산을 줄여줌 (v8~v10에서 반복된 calib 과적합 패턴과는 성격이 다름).
-        # v15: LightGBM 단독 앙상블에 XGBoost도 섞은 '모델 블렌딩'으로 확장 (modeling.py 참고).
-        #      train_baseline.py와 backtest.py가 반드시 같은 함수를 쓰도록 공용화함
-        #      (파워커브 피처 때 두 스크립트 로직이 어긋났던 사고 재발 방지).
-        trained = train_blended_ensemble(X_tr_imp, y_tr, X_cal_imp, y_cal, log_target=USE_LOG_TARGET)
-        models = trained  # 아래 최종 재학습 단계에서 재사용
-        print(f"[{target}] 앙상블 구성: " + ", ".join(f"{k}(seed={s},iter={bi})" for k, s, _, bi, _ in trained))
+        SEEDS = [42, 123, 2024]
+        LGBM_PARAMS = dict(
+            n_estimators=2000,
+            learning_rate=0.03,
+            max_depth=7,
+            num_leaves=31,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            objective="mae",
+            n_jobs=-1,
+            verbose=-1,
+        )
+
+        def ensemble_predict(models, X_imp):
+            preds = np.column_stack([m.predict(X_imp) for m in models])
+            return preds.mean(axis=1)
+
+        models = []
+        best_iterations = []
+        for seed in SEEDS:
+            m = lgb.LGBMRegressor(random_state=seed, **LGBM_PARAMS)
+            m.fit(
+                X_tr_imp, y_tr,
+                eval_set=[(X_cal_imp, y_cal)],
+                callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+            )
+            models.append(m)
+            best_iterations.append(m.best_iteration_)
+        print(f"[{target}] 앙상블 {len(SEEDS)}개 시드, best_iteration={best_iterations}")
 
         # calib 구간에서 '보정식' 학습.
         # v4에서 isotonic이 calib 데이터 부족으로 과적합해 오히려 성능이 나빠진 것을 확인했음.
@@ -318,24 +270,22 @@ def main():
         predictions_holdout_calibrated[target] = pred_ho_calibrated
         holdout_actual[target] = y_ho.values
 
-        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 재학습 후 같은 보정식 적용
-        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 앞서 찾은 best_iteration을 그대로 사용
+        # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 시드별 재학습 후 같은 보정식 적용
+        # 이 단계는 별도 검증셋이 없으므로 조기종료 대신 각 시드에서 찾은 best_iteration을 그대로 사용
         X_fit = pd.concat([X_tr, X_cal])
         y_fit = pd.concat([y_tr, y_cal])
         X_fit_imp = pd.DataFrame(imputer.fit_transform(X_fit), columns=X_fit.columns)
 
-        final_models = refit_final_models(trained, X_fit_imp, y_fit)
+        final_models = []
+        for seed, best_iter in zip(SEEDS, best_iterations):
+            fm = lgb.LGBMRegressor(random_state=seed, **{**LGBM_PARAMS, "n_estimators": best_iter})
+            fm.fit(X_fit_imp, y_fit)
+            final_models.append(fm)
 
         X_test = build_features(sample_submission[["forecast_id", "forecast_kst_dtm"]], test_weather[target], "forecast_kst_dtm")
-        X_test["power_curve_estimate"] = apply_power_curve(
-            power_curve, fallback_ws, X_test[power_curve_col], CAPACITY_KWH[target]
-        )
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
-        pred_test_raw = np.clip(final_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
+        pred_test_raw = np.clip(ensemble_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
         pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
-        # v13에서 raw로 바꿔 실제 리더보드 테스트한 결과, 보정 버전(v11, 0.6146)이
-        # raw(v13, 0.6073)보다 근소하게 나음. 백테스트는 반대였으나 차이(0.007)가 노이즈
-        # 수준이라 보정 여부 자체는 큰 지렛대가 아닌 것으로 결론. v11 방식(보정)으로 복귀.
         predictions_test[target] = pred_test_calibrated
 
         print(f"[{target}] train={len(X_tr)}, calib={len(X_cal)}, holdout={len(X_ho)}")
@@ -372,7 +322,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v20_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v11_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

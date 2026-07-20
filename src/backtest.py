@@ -39,6 +39,7 @@ from train_baseline import (
     DATA_DIR,
     TRAIN_DIR,
     N_NEAREST_GRIDS,
+    USE_LOG_TARGET,
 )
 from modeling import train_blended_ensemble, ensemble_predict
 from evaluate import metric
@@ -107,6 +108,7 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
         models = train_blended_ensemble(
             X_tr_imp, y_tr, X_cal_imp, y_cal,
             lgbm_seeds=LGBM_SEEDS_BACKTEST, xgb_seeds=XGB_SEEDS_BACKTEST,
+            log_target=USE_LOG_TARGET,
         )
 
         pc = ensemble_predict(models, X_cal_imp)

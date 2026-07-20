@@ -1,5 +1,5 @@
 """
-LightGBM+XGBoost 블렌딩 베이스라인 (v18).
+LightGBM+XGBoost 블렌딩 베이스라인 (v20).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -96,6 +96,7 @@ SUBMISSION_DIR = Path(__file__).resolve().parent.parent / "submissions"
 
 N_NEAREST_GRIDS = 3       # 그룹 좌표에서 가장 가까운 격자 몇 개를 쓸지
 HOLDOUT_DAYS = 90         # 로컬 검증용 최근 N일을 holdout으로 분리 (시계열이므로 랜덤분할 금지)
+USE_LOG_TARGET = True     # v20: 발전량을 log1p 변환해서 학습 (저출력 구간 상대오차에 더 민감하게)
 CALIB_DAYS = 60           # holdout 바로 이전 N일을 '보정식 학습용'으로 별도 분리 (holdout과 절대 겹치지 않음)
 
 
@@ -267,9 +268,9 @@ def main():
         # v15: LightGBM 단독 앙상블에 XGBoost도 섞은 '모델 블렌딩'으로 확장 (modeling.py 참고).
         #      train_baseline.py와 backtest.py가 반드시 같은 함수를 쓰도록 공용화함
         #      (파워커브 피처 때 두 스크립트 로직이 어긋났던 사고 재발 방지).
-        trained = train_blended_ensemble(X_tr_imp, y_tr, X_cal_imp, y_cal)
+        trained = train_blended_ensemble(X_tr_imp, y_tr, X_cal_imp, y_cal, log_target=USE_LOG_TARGET)
         models = trained  # 아래 최종 재학습 단계에서 재사용
-        print(f"[{target}] 앙상블 구성: " + ", ".join(f"{k}(seed={s},iter={bi})" for k, s, _, bi in trained))
+        print(f"[{target}] 앙상블 구성: " + ", ".join(f"{k}(seed={s},iter={bi})" for k, s, _, bi, _ in trained))
 
         # calib 구간에서 '보정식' 학습.
         # v4에서 isotonic이 calib 데이터 부족으로 과적합해 오히려 성능이 나빠진 것을 확인했음.
@@ -371,7 +372,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v18_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v20_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

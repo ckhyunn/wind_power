@@ -181,3 +181,59 @@ def nmae_score(pred: pd.DataFrame, actual: pd.DataFrame, capacity: dict = CAPACI
 
 def total_score(pred: pd.DataFrame, actual: pd.DataFrame, capacity: dict = CAPACITY_KWH):
     return metric(actual, pred, target_cols=list(capacity.keys()), capacity=capacity)
+
+
+def group_score(actual: np.ndarray, forecast: np.ndarray, cap: float):
+    """
+    metric()의 그룹 1개 버전. 최적화 탐색(find_best_ficr_adjustment)에서
+    반복 호출하기 위해 분리. 반환: (total_score, one_minus_nmae, ficr)
+    """
+    valid = actual >= cap * 0.10
+    actual_v, forecast_v = actual[valid], forecast[valid]
+    if len(actual_v) == 0:
+        return np.nan, np.nan, np.nan
+
+    error_rate = np.abs(forecast_v - actual_v) / cap
+    nmae = np.mean(error_rate)
+
+    unit_price = np.select(
+        [error_rate <= 0.06, error_rate <= 0.08],
+        [4.0, 3.0],
+        default=0.0,
+    )
+    earned = np.sum(actual_v * unit_price)
+    max_settlement = np.sum(actual_v * 4.0)
+    ficr = earned / max_settlement if max_settlement > 0 else np.nan
+
+    return 0.5 * (1 - nmae) + 0.5 * ficr, 1 - nmae, ficr
+
+
+def find_best_ficr_adjustment(actual_cal: np.ndarray, pred_cal: np.ndarray, cap: float,
+                               scale_range=None, shift_range=None):
+    """
+    [v23] MAE를 최소화하는 보정과는 별개로, calib 데이터에서 '공식 Score(FICR 포함)를
+    직접 최대화'하는 배율(scale)/이동(shift)을 찾는다.
+
+    왜 필요한가: MAE 최소화와 FICR 최대화는 다른 문제임. FICR은 6%/8% 문턱을 넘느냐
+    마느냐로 계단식 보상이 갈리는데, MAE는 이 문턱 구조를 전혀 모르고 그냥 평균
+    절대오차만 줄이려 함. 예를 들어 전체 예측을 살짝 올리면(scale>1) 문턱을 살짝
+    못 넘던 시간대들이 대거 안으로 들어올 수 있는데, 이런 조정은 MAE 최소화 관점에서는
+    최적이 아닐 수 있어도 실제 Score(FICR 포함) 관점에서는 이득일 수 있음.
+
+    scale_range/shift_range: 탐색할 배율/이동값 후보. 기본은 -+15% 배율, -+3% 이동.
+    반환: (best_scale, best_shift, best_score) - best_score는 calib에서 달성한 Score.
+    """
+    if scale_range is None:
+        scale_range = np.arange(0.85, 1.16, 0.01)
+    if shift_range is None:
+        shift_range = np.arange(-0.03, 0.031, 0.01) * cap  # 정격의 -3%~+3%를 절대값으로
+
+    best_scale, best_shift, best_score = 1.0, 0.0, -np.inf
+    for s in scale_range:
+        for sh in shift_range:
+            adjusted = np.clip(pred_cal * s + sh, 0, cap)
+            score, _, _ = group_score(actual_cal, adjusted, cap)
+            if not np.isnan(score) and score > best_score:
+                best_score, best_scale, best_shift = score, s, sh
+
+    return best_scale, best_shift, best_score

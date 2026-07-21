@@ -1,5 +1,5 @@
 """
-LightGBM+XGBoost 블렌딩 베이스라인 (v22).
+LightGBM+XGBoost 블렌딩 베이스라인 (v25).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -91,7 +91,7 @@ from features import (
     fit_power_curve,
     apply_power_curve,
 )
-from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile
+from evaluate import metric, error_rate_breakdown, bias_diagnosis, bias_by_prediction_quantile, find_best_ficr_adjustment, group_score
 from modeling import train_blended_ensemble, ensemble_predict, refit_final_models, final_predict
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -266,6 +266,7 @@ def main():
     predictions_test = pd.DataFrame({"forecast_kst_dtm": sample_submission["forecast_kst_dtm"]})
     predictions_holdout_raw = {}
     predictions_holdout_calibrated = {}
+    predictions_holdout_ficr_adjusted = {}
     holdout_actual = {}
     calibrators = {}
 
@@ -392,12 +393,38 @@ def main():
         calibrators[target] = calibrator
         print(f"[{target}] 보정 방식 선택: {chosen} (calib_val 오차율 - linear={linear_err:.4f}, isotonic={isotonic_err:.4f})")
 
-        # holdout에서 raw 예측 vs 보정 후 예측 둘 다 계산해서 개선 여부 확인
+        # v23: MAE 최소화(보정)와는 별개로, '공식 Score(FICR 포함)를 직접 최대화'하는
+        # 배율/이동을 추가로 탐색. FICR은 6%/8% 문턱 구조라 MAE 최적화와 다른 지점이
+        # 최적일 수 있음.
+        # v24 [기각]: calib_fit/calib_val로 분리 검증했으나, backtest에서 오히려 평균이
+        # 떨어짐(0.6159→0.6017). 문제였던 윈도우(2023-10~2024-01)도 여전히 개선 안 됨
+        # -> 그 윈도우의 문제는 'calib 내부 과적합'이 아니라 'calib 기간 자체가 그 시기를
+        #    대표하지 못하는 것'이라 내부 분리검증으로는 해결이 안 됨. 오히려 탐색에 쓸
+        #    데이터만 반토막나서 다른 윈도우들 품질도 같이 떨어짐.
+        # v25: '분리검증'이 아니라 '수축(shrinkage)'으로 방향 전환.
+        #    calib 전체(v23 방식)로 배율/이동을 찾되, 찾은 값을 100% 그대로 적용하지 않고
+        #    항등변환(scale=1, shift=0) 쪽으로 SHRINKAGE 비율만큼 완화해서 적용.
+        #    즉 '확신 있는 방향으로 일부만 이동' - 전부 채택도 전부 기각도 아닌 중간.
+        pred_cal_calibrated = np.clip(calibrator.predict(pred_cal), 0, CAPACITY_KWH[target])
+        raw_scale, raw_shift, _ = find_best_ficr_adjustment(
+            y_cal.values, pred_cal_calibrated, CAPACITY_KWH[target]
+        )
+
+        FICR_SHRINKAGE = 0.6  # 찾은 조정값의 60%만 적용 (1.0=v23과 동일, 0.0=조정 없음)
+        ficr_scale = 1.0 + FICR_SHRINKAGE * (raw_scale - 1.0)
+        ficr_shift = FICR_SHRINKAGE * raw_shift
+        print(f"[{target}] FICR 조정 (수축 {FICR_SHRINKAGE:.0%} 적용): "
+              f"탐색값(배율={raw_scale:.2f},이동={raw_shift:.0f}) -> "
+              f"실제적용(배율={ficr_scale:.2f},이동={ficr_shift:.0f})")
+
+        # holdout에서 raw 예측 vs 보정 후 예측 vs FICR추가조정 예측 셋 다 계산해서 비교
         pred_ho_raw = np.clip(ensemble_predict(models, X_ho_imp), 0, CAPACITY_KWH[target])
         pred_ho_calibrated = np.clip(calibrator.predict(pred_ho_raw), 0, CAPACITY_KWH[target])
+        pred_ho_ficr_adjusted = np.clip(pred_ho_calibrated * ficr_scale + ficr_shift, 0, CAPACITY_KWH[target])
 
         predictions_holdout_raw[target] = pred_ho_raw
         predictions_holdout_calibrated[target] = pred_ho_calibrated
+        predictions_holdout_ficr_adjusted[target] = pred_ho_ficr_adjusted
         holdout_actual[target] = y_ho.values
 
         # 최종 제출용 모델: holdout을 제외한 전체(train+calib)로 재학습 후 같은 보정식 적용
@@ -421,10 +448,9 @@ def main():
         X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
         pred_test_raw = np.clip(final_predict(final_models, X_test_imp), 0, CAPACITY_KWH[target])
         pred_test_calibrated = np.clip(calibrator.predict(pred_test_raw), 0, CAPACITY_KWH[target])
-        # v13에서 raw로 바꿔 실제 리더보드 테스트한 결과, 보정 버전(v11, 0.6146)이
-        # raw(v13, 0.6073)보다 근소하게 나음. 백테스트는 반대였으나 차이(0.007)가 노이즈
-        # 수준이라 보정 여부 자체는 큰 지렛대가 아닌 것으로 결론. v11 방식(보정)으로 복귀.
-        predictions_test[target] = pred_test_calibrated
+        # v23: calib에서 찾은 FICR 최적화 배율/이동을 최종 제출값에도 동일하게 적용.
+        pred_test_ficr_adjusted = np.clip(pred_test_calibrated * ficr_scale + ficr_shift, 0, CAPACITY_KWH[target])
+        predictions_test[target] = pred_test_ficr_adjusted
 
         print(f"[{target}] train={len(X_tr)}, calib={len(X_cal)}, holdout={len(X_ho)}")
 
@@ -437,22 +463,24 @@ def main():
     actual_df = to_df(holdout_actual)
     pred_df_raw = to_df(predictions_holdout_raw)
     pred_df_calibrated = to_df(predictions_holdout_calibrated)
+    pred_df_ficr_adjusted = to_df(predictions_holdout_ficr_adjusted)
 
     score_raw, nmae_raw, ficr_raw = metric(actual_df, pred_df_raw)
     score_cal, nmae_cal, ficr_cal = metric(actual_df, pred_df_calibrated)
+    score_fa, nmae_fa, ficr_fa = metric(actual_df, pred_df_ficr_adjusted)
 
-    print("\n[보정 전 vs 보정 후 - holdout 구간, 공식 산식 기준]")
-    print(f"{'지표':<10}{'보정 전':>12}{'보정 후':>12}")
-    print(f"{'Score':<10}{score_raw:>12.4f}{score_cal:>12.4f}")
-    print(f"{'1-NMAE':<10}{nmae_raw:>12.4f}{nmae_cal:>12.4f}")
-    print(f"{'FICR':<10}{ficr_raw:>12.4f}{ficr_cal:>12.4f}")
+    print("\n[raw vs 보정 후 vs FICR추가조정 - holdout 구간, 공식 산식 기준]")
+    print(f"{'지표':<10}{'raw':>12}{'보정 후':>12}{'FICR조정':>12}")
+    print(f"{'Score':<10}{score_raw:>12.4f}{score_cal:>12.4f}{score_fa:>12.4f}")
+    print(f"{'1-NMAE':<10}{nmae_raw:>12.4f}{nmae_cal:>12.4f}{nmae_fa:>12.4f}")
+    print(f"{'FICR':<10}{ficr_raw:>12.4f}{ficr_cal:>12.4f}{ficr_fa:>12.4f}")
 
-    print("\n[오차율 구간별 분포 - 보정 후]")
-    print(error_rate_breakdown(actual_df, pred_df_calibrated).to_string(index=False))
-    print("\n[편향 진단 - 보정 후]")
-    print(bias_diagnosis(actual_df, pred_df_calibrated).to_string(index=False))
-    print("\n[예측값 구간별(quantile) 편향 - 보정 후, 선형 보정이 구간별로도 고르게 먹혔는지 확인]")
-    print(bias_by_prediction_quantile(actual_df, pred_df_calibrated).to_string(index=False))
+    print("\n[오차율 구간별 분포 - FICR추가조정 후]")
+    print(error_rate_breakdown(actual_df, pred_df_ficr_adjusted).to_string(index=False))
+    print("\n[편향 진단 - FICR추가조정 후]")
+    print(bias_diagnosis(actual_df, pred_df_ficr_adjusted).to_string(index=False))
+    print("\n[예측값 구간별(quantile) 편향 - FICR추가조정 후]")
+    print(bias_by_prediction_quantile(actual_df, pred_df_ficr_adjusted).to_string(index=False))
 
     SUBMISSION_DIR.mkdir(exist_ok=True)
     submission = sample_submission[["forecast_id", "forecast_kst_dtm"]].copy()
@@ -460,7 +488,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v22_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v25_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

@@ -42,7 +42,7 @@ from train_baseline import (
     USE_LOG_TARGET,
 )
 from modeling import train_blended_ensemble, ensemble_predict
-from evaluate import metric
+from evaluate import metric, find_best_ficr_adjustment, group_score
 
 CALIB_DAYS = 45
 # 백테스트는 속도 위해 시드 수를 줄임 (본 제출용 train_baseline.py는 더 많이 사용).
@@ -66,7 +66,7 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
     calib_end = holdout_start - pd.Timedelta(days=1)
     calib_start = calib_end - pd.Timedelta(days=CALIB_DAYS)
 
-    pred_raw, pred_cal, actual = {}, {}, {}
+    pred_raw, pred_cal, pred_fa, actual = {}, {}, {}, {}
 
     for target in TARGET_COLS:
         weather = train_weather[target]
@@ -135,11 +135,22 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
             else:
                 calibrator = _Reshape1DWrapper(LinearRegression().fit(pc.reshape(-1, 1), y_cal))
 
+        # v24 [기각] -> v25: 분리검증 대신 수축(shrinkage) 방식으로 전환.
+        # calib 전체로 배율/이동을 찾되, 찾은 값의 일부만 적용 (train_baseline.py와 동일 로직)
+        pc_calibrated = np.clip(calibrator.predict(pc), 0, CAPACITY_KWH[target])
+        raw_scale, raw_shift, _ = find_best_ficr_adjustment(y_cal.values, pc_calibrated, CAPACITY_KWH[target])
+
+        FICR_SHRINKAGE = 0.6
+        ficr_scale = 1.0 + FICR_SHRINKAGE * (raw_scale - 1.0)
+        ficr_shift = FICR_SHRINKAGE * raw_shift
+
         pr_raw = np.clip(ensemble_predict(models, X_ho_imp), 0, CAPACITY_KWH[target])
         pr_cal = np.clip(calibrator.predict(pr_raw), 0, CAPACITY_KWH[target])
+        pr_fa = np.clip(pr_cal * ficr_scale + ficr_shift, 0, CAPACITY_KWH[target])
 
         pred_raw[target] = pr_raw
         pred_cal[target] = pr_cal
+        pred_fa[target] = pr_fa
         actual[target] = y_ho.values
 
     if not actual:
@@ -151,17 +162,20 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
     actual_df = to_df(actual)
     raw_df = to_df(pred_raw)
     cal_df = to_df(pred_cal)
+    fa_df = to_df(pred_fa)
     included_groups = list(actual.keys())
     cap_subset = {k: CAPACITY_KWH[k] for k in included_groups}
 
     score_raw, nmae_raw, ficr_raw = metric(actual_df, raw_df, target_cols=included_groups, capacity=cap_subset)
     score_cal, nmae_cal, ficr_cal = metric(actual_df, cal_df, target_cols=included_groups, capacity=cap_subset)
+    score_fa, nmae_fa, ficr_fa = metric(actual_df, fa_df, target_cols=included_groups, capacity=cap_subset)
 
     return dict(
         window=f"{holdout_start.date()}~{holdout_end.date()}",
         groups=",".join(g.replace("kpx_group_", "g") for g in included_groups),
         score_raw=score_raw, nmae_raw=nmae_raw, ficr_raw=ficr_raw,
         score_cal=score_cal, nmae_cal=nmae_cal, ficr_cal=ficr_cal,
+        score_fa=score_fa, nmae_fa=nmae_fa, ficr_fa=ficr_fa,
     )
 
 
@@ -185,7 +199,7 @@ def run_backtest() -> pd.DataFrame:
         if r:
             results.append(r)
             print(f"  포함 그룹: {r['groups']}")
-            print(f"  Score(raw)={r['score_raw']:.4f}  Score(calibrated)={r['score_cal']:.4f}")
+            print(f"  Score(raw)={r['score_raw']:.4f}  Score(calibrated)={r['score_cal']:.4f}  Score(FICR조정)={r['score_fa']:.4f}")
         else:
             print("  이 윈도우는 평가 가능한 그룹이 없어 건너뜀")
 
@@ -206,7 +220,7 @@ def main():
     print("\n" + "=" * 70)
     print("평균 (표준편차) - 이 숫자를 개선 여부 판단 기준으로 사용")
     print("=" * 70)
-    for col in ["score_raw", "nmae_raw", "ficr_raw", "score_cal", "nmae_cal", "ficr_cal"]:
+    for col in ["score_raw", "nmae_raw", "ficr_raw", "score_cal", "nmae_cal", "ficr_cal", "score_fa", "nmae_fa", "ficr_fa"]:
         print(f"{col:12s}: {df[col].mean():.4f}  (±{df[col].std():.4f})")
 
 

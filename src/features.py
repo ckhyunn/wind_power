@@ -180,6 +180,31 @@ def aggregate_weather_for_group(df: pd.DataFrame, grid_ids: list, prefix: str) -
     return agg.reset_index()
 
 
+def aggregate_wind_speed_per_grid(df: pd.DataFrame, grid_ids: list, u_col: str, v_col: str, prefix: str) -> pd.DataFrame:
+    """
+    [v21 버그수정] 격자별로 풍속을 '먼저' 계산한 뒤 시간별로 집계 (mean/max/std).
+
+    팀원 EDA(도메인지식_정리.md)에서 확인된 기존 방식의 문제:
+      u/v 성분을 격자 간 먼저 평균하면, 방향이 다른 바람이 서로 상쇄되어
+      풍속이 과소평가됨 (예: 동풍 5m/s + 서풍 5m/s의 u 평균 = 0).
+    순서를 바꿔 [격자별 풍속 계산 -> 집계]로 하면 상쇄가 발생하지 않음.
+
+    max를 포함하는 이유: 같은 단지 안에서도 능선 위 위치 차이로 터빈별 바람 자원이
+    약 1.7배까지 갈리는 산악 지형이라(팀원 EDA), 격자 평균보다 격자 최대가
+    실제 상위 터빈들의 바람을 더 잘 대표할 수 있음.
+    """
+    sub = df[df["grid_id"].isin(grid_ids)].copy()
+    sub["forecast_kst_dtm"] = pd.to_datetime(sub["forecast_kst_dtm"])
+    sub["_speed"] = np.sqrt(sub[u_col] ** 2 + sub[v_col] ** 2)
+    g = sub.groupby("forecast_kst_dtm")["_speed"]
+    out = pd.DataFrame({
+        f"{prefix}_gridfirst_mean": g.mean(),
+        f"{prefix}_gridfirst_max": g.max(),
+        f"{prefix}_gridfirst_std": g.std(),
+    }).reset_index()
+    return out
+
+
 def aggregate_weather_dispersion(df: pd.DataFrame, grid_ids: list, cols: list, prefix: str) -> pd.DataFrame:
     """
     지정된 grid_ids 간의 값 차이(표준편차)를 피처로 만듦.
@@ -290,6 +315,67 @@ def fit_power_curve(wind_speed: pd.Series, generation: pd.Series):
 def apply_power_curve(curve, fallback_ws: float, wind_speed: pd.Series, capacity: float) -> np.ndarray:
     """fit_power_curve()로 적합한 커브를 새 데이터(calib/holdout/test)에 적용"""
     return np.clip(curve.predict(wind_speed.fillna(fallback_ws)), 0, capacity)
+
+
+# 그룹-터빈 매핑 (info.xlsx 분석으로 확정)
+SCADA_GROUP_TURBINES = {
+    "kpx_group_1": ("vestas", list(range(1, 7))),
+    "kpx_group_2": ("vestas", list(range(7, 13))),
+    "kpx_group_3": ("unison", list(range(1, 6))),
+}
+
+# 터빈 1기당 정격용량(kW). VESTAS V126=3600kW, UNISON U136=4200kW
+TURBINE_CAPACITY_KW = {"vestas": 3600, "unison": 4200}
+
+
+def load_clean_scada_group(scada_df: pd.DataFrame, prefix: str, turbine_ids: list) -> pd.DataFrame:
+    """
+    SCADA 원본(10분 단위)을 그룹 단위로 정제 + 시간별 집계.
+
+    v22 수정 (팀원 EDA eda_report.md §6에서 실증된 두 가지 반영):
+      1. power_kw10m은 이름과 달리 순간전력(kW)이 아니라 '10분 구간 에너지(kWh)'
+         -> 시간 집계는 .mean()이 아니라 .sum() (mean이면 조용히 약 1/6로 축소됨.
+            r=0.9998, 비율 0.986으로 sum이 라벨과 1:1 대응함이 검증됨)
+      2. kst_dtm은 시간 끝(end-of-hour) 컨벤션
+         -> resample("h", label="right", closed="right")
+
+    이상치 제거(diagnose_vestas.py에서 확인): 음수, 정격 1.1배 초과 -> NaN 처리.
+    (팀원 EDA는 작은 음수는 유휴 소비전력일 수 있다 했지만, 파워커브 용도로는 제외가 안전)
+
+    반환: kst_dtm, actual_ws(그룹 평균 실측 풍속), actual_energy_kwh(그룹 시간당 발전량)
+    """
+    df = scada_df.copy()
+    df["kst_dtm"] = pd.to_datetime(df["kst_dtm"])
+    cap_10min = TURBINE_CAPACITY_KW[prefix] / 6  # 10분 최대 에너지(kWh) = 정격kW / 6
+
+    power_cols = [f"{prefix}_wtg{i:02d}_power_kw10m" for i in turbine_ids]
+    ws_cols = [f"{prefix}_wtg{i:02d}_ws" for i in turbine_ids]
+
+    for pc in power_cols:
+        bad = (df[pc] < 0) | (df[pc] > cap_10min * 1.1)
+        df.loc[bad, pc] = np.nan
+
+    df["_group_energy_10min"] = df[power_cols].sum(axis=1, skipna=True)
+    df["_group_ws"] = df[ws_cols].mean(axis=1, skipna=True)
+
+    hourly = df.set_index("kst_dtm").resample("h", label="right", closed="right").agg(
+        actual_energy_kwh=("_group_energy_10min", "sum"),
+        actual_ws=("_group_ws", "mean"),
+    ).reset_index()
+    return hourly
+
+
+def fit_ws_calibration(forecast_ws: pd.Series, actual_ws: pd.Series):
+    """'예보 풍속 -> SCADA 실측 풍속' 환산 회귀식. 반드시 겹치는 학습기간 데이터로만 적합."""
+    from sklearn.linear_model import LinearRegression
+    valid = forecast_ws.notna() & actual_ws.notna()
+    reg = LinearRegression()
+    reg.fit(forecast_ws[valid].to_numpy().reshape(-1, 1), actual_ws[valid])
+    return reg
+
+
+def apply_ws_calibration(reg, forecast_ws: pd.Series, fallback: float) -> np.ndarray:
+    return reg.predict(forecast_ws.fillna(fallback).to_numpy().reshape(-1, 1))
 
 
 def calendar_features(dt_series: pd.Series) -> pd.DataFrame:

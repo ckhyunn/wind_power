@@ -60,13 +60,18 @@ BACKTEST_WINDOWS = [
     ("2024-04-01", "2024-06-30"),   # 봄 2024 (전체 그룹)
 ]
 
+# v26: FICR 조정 수축 비율(v25에서 0.6 고정값으로 썼던 것)의 최적값을 탐색.
+# 0.0=조정 없음(보정만), 1.0=v23과 동일(탐색값 그대로 전량 적용)
+SHRINKAGE_CANDIDATES = [0.0, 0.2, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+
 
 def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
                      train_labels: pd.DataFrame, train_weather: dict) -> dict | None:
     calib_end = holdout_start - pd.Timedelta(days=1)
     calib_start = calib_end - pd.Timedelta(days=CALIB_DAYS)
 
-    pred_raw, pred_cal, pred_fa, actual = {}, {}, {}, {}
+    pred_raw, pred_cal, actual = {}, {}, {}
+    pred_fa_by_shrink = {shrink: {} for shrink in SHRINKAGE_CANDIDATES}
 
     for target in TARGET_COLS:
         weather = train_weather[target]
@@ -136,21 +141,22 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
                 calibrator = _Reshape1DWrapper(LinearRegression().fit(pc.reshape(-1, 1), y_cal))
 
         # v24 [기각] -> v25: 분리검증 대신 수축(shrinkage) 방식으로 전환.
-        # calib 전체로 배율/이동을 찾되, 찾은 값의 일부만 적용 (train_baseline.py와 동일 로직)
+        # calib 전체로 배율/이동을 찾음 (탐색 자체는 1번만 - 학습을 다시 안 해도 되므로 저렴)
         pc_calibrated = np.clip(calibrator.predict(pc), 0, CAPACITY_KWH[target])
         raw_scale, raw_shift, _ = find_best_ficr_adjustment(y_cal.values, pc_calibrated, CAPACITY_KWH[target])
 
-        FICR_SHRINKAGE = 0.6
-        ficr_scale = 1.0 + FICR_SHRINKAGE * (raw_scale - 1.0)
-        ficr_shift = FICR_SHRINKAGE * raw_shift
-
         pr_raw = np.clip(ensemble_predict(models, X_ho_imp), 0, CAPACITY_KWH[target])
         pr_cal = np.clip(calibrator.predict(pr_raw), 0, CAPACITY_KWH[target])
-        pr_fa = np.clip(pr_cal * ficr_scale + ficr_shift, 0, CAPACITY_KWH[target])
+
+        # v26: 수축 비율(0.6 고정) 자체도 튜닝 대상. 모델을 다시 학습할 필요 없이
+        # 같은 raw_scale/raw_shift에 여러 수축 비율을 적용만 하면 되므로 저렴하게 스윕 가능.
+        for shrink in SHRINKAGE_CANDIDATES:
+            s = 1.0 + shrink * (raw_scale - 1.0)
+            sh = shrink * raw_shift
+            pred_fa_by_shrink[shrink][target] = np.clip(pr_cal * s + sh, 0, CAPACITY_KWH[target])
 
         pred_raw[target] = pr_raw
         pred_cal[target] = pr_cal
-        pred_fa[target] = pr_fa
         actual[target] = y_ho.values
 
     if not actual:
@@ -162,21 +168,25 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
     actual_df = to_df(actual)
     raw_df = to_df(pred_raw)
     cal_df = to_df(pred_cal)
-    fa_df = to_df(pred_fa)
     included_groups = list(actual.keys())
     cap_subset = {k: CAPACITY_KWH[k] for k in included_groups}
 
     score_raw, nmae_raw, ficr_raw = metric(actual_df, raw_df, target_cols=included_groups, capacity=cap_subset)
     score_cal, nmae_cal, ficr_cal = metric(actual_df, cal_df, target_cols=included_groups, capacity=cap_subset)
-    score_fa, nmae_fa, ficr_fa = metric(actual_df, fa_df, target_cols=included_groups, capacity=cap_subset)
 
-    return dict(
+    result = dict(
         window=f"{holdout_start.date()}~{holdout_end.date()}",
         groups=",".join(g.replace("kpx_group_", "g") for g in included_groups),
         score_raw=score_raw, nmae_raw=nmae_raw, ficr_raw=ficr_raw,
         score_cal=score_cal, nmae_cal=nmae_cal, ficr_cal=ficr_cal,
-        score_fa=score_fa, nmae_fa=nmae_fa, ficr_fa=ficr_fa,
     )
+    for shrink in SHRINKAGE_CANDIDATES:
+        fa_df = to_df(pred_fa_by_shrink[shrink])
+        s, n, f = metric(actual_df, fa_df, target_cols=included_groups, capacity=cap_subset)
+        result[f"score_fa_{shrink}"] = s
+        result[f"ficr_fa_{shrink}"] = f
+
+    return result
 
 
 def run_backtest() -> pd.DataFrame:
@@ -199,7 +209,9 @@ def run_backtest() -> pd.DataFrame:
         if r:
             results.append(r)
             print(f"  포함 그룹: {r['groups']}")
-            print(f"  Score(raw)={r['score_raw']:.4f}  Score(calibrated)={r['score_cal']:.4f}  Score(FICR조정)={r['score_fa']:.4f}")
+            fa_summary = ", ".join(f"{s}:{r[f'score_fa_{s}']:.4f}" for s in SHRINKAGE_CANDIDATES)
+            print(f"  Score(raw)={r['score_raw']:.4f}  Score(calibrated)={r['score_cal']:.4f}")
+            print(f"  Score(FICR조정, 수축비율별)= {fa_summary}")
         else:
             print("  이 윈도우는 평가 가능한 그룹이 없어 건너뜀")
 
@@ -218,10 +230,18 @@ def main():
     print(df.to_string(index=False))
 
     print("\n" + "=" * 70)
-    print("평균 (표준편차) - 이 숫자를 개선 여부 판단 기준으로 사용")
+    print("평균 (표준편차) - raw/보정")
     print("=" * 70)
-    for col in ["score_raw", "nmae_raw", "ficr_raw", "score_cal", "nmae_cal", "ficr_cal", "score_fa", "nmae_fa", "ficr_fa"]:
+    for col in ["score_raw", "nmae_raw", "ficr_raw", "score_cal", "nmae_cal", "ficr_cal"]:
         print(f"{col:12s}: {df[col].mean():.4f}  (±{df[col].std():.4f})")
+
+    print("\n" + "=" * 70)
+    print("수축 비율별 Score 평균 (표준편차) - 이 표로 최적 수축 비율을 판단")
+    print("=" * 70)
+    print(f"{'수축비율':>10}{'평균 Score':>14}{'표준편차':>12}")
+    for shrink in SHRINKAGE_CANDIDATES:
+        col = f"score_fa_{shrink}"
+        print(f"{shrink:>10.1f}{df[col].mean():>14.4f}{df[col].std():>12.4f}")
 
 
 if __name__ == "__main__":

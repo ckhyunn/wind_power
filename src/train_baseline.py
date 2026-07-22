@@ -410,7 +410,7 @@ def main():
             y_cal.values, pred_cal_calibrated, CAPACITY_KWH[target]
         )
 
-        FICR_SHRINKAGE = 0.6  # 찾은 조정값의 60%만 적용 (1.0=v23과 동일, 0.0=조정 없음)
+        FICR_SHRINKAGE = 0.5  # 찾은 조정값의 50%만 적용 (backtest 스윕 결과 표준편차 최소점, 1.0=v23과 동일, 0.0=조정 없음)
         ficr_scale = 1.0 + FICR_SHRINKAGE * (raw_scale - 1.0)
         ficr_shift = FICR_SHRINKAGE * raw_shift
         print(f"[{target}] FICR 조정 (수축 {FICR_SHRINKAGE:.0%} 적용): "

@@ -237,3 +237,67 @@ def find_best_ficr_adjustment(actual_cal: np.ndarray, pred_cal: np.ndarray, cap:
                 best_score, best_scale, best_shift = score, s, sh
 
     return best_scale, best_shift, best_score
+
+
+def fit_segmented_ficr_adjustment(actual_cal: np.ndarray, pred_cal: np.ndarray, cap: float,
+                                   n_segments: int = 3, shrinkage: float = 0.5):
+    """
+    [v27] find_best_ficr_adjustment()을 예측값 구간별로 따로 적용.
+
+    배경: bias_by_prediction_quantile()에서 확인된 대로, 편향은 예측값 구간마다 크기와
+    부호가 다름(중간 구간이 가장 심하고, 일부 그룹은 고발전 구간에서 부호가 반전됨).
+    전역 배율/이동 하나로는 한쪽을 고치면 다른 쪽이 더 틀어지는 절충이 불가피함.
+    -> 예측값을 n_segments개 구간으로 나눠 구간마다 별도의 (배율, 이동)을 찾음.
+
+    각 구간의 조정에도 shrinkage를 적용 (v25/v26에서 검증된 원칙 재사용 - 구간을 나누면
+    구간당 데이터가 더 줄어들어 과적합 위험이 커지므로 안전장치가 더욱 중요함).
+
+    반환: [(구간중심값, 최종배율, 최종이동), ...] - 구간중심값 오름차순 정렬.
+    apply_segmented_adjustment()에서 이 리스트로 부드럽게 보간해서 적용.
+    """
+    try:
+        bins = pd.qcut(pred_cal, q=n_segments, duplicates="drop")
+    except ValueError:
+        # 데이터가 너무 적어 구간을 못 나누면 전역 조정 하나로 대체
+        scale, shift, _ = find_best_ficr_adjustment(actual_cal, pred_cal, cap)
+        center = float(np.median(pred_cal))
+        final_scale = 1.0 + shrinkage * (scale - 1.0)
+        final_shift = shrinkage * shift
+        return [(center, final_scale, final_shift)]
+
+    segments = []
+    for b in pd.unique(bins):
+        mask = bins == b
+        if mask.sum() < 10:  # 구간 데이터가 너무 적으면 건너뜀 (안정성)
+            continue
+        actual_seg, pred_seg = actual_cal[mask], pred_cal[mask]
+        scale, shift, _ = find_best_ficr_adjustment(actual_seg, pred_seg, cap)
+        final_scale = 1.0 + shrinkage * (scale - 1.0)
+        final_shift = shrinkage * shift
+        center = float(np.median(pred_seg))
+        segments.append((center, final_scale, final_shift))
+
+    if not segments:
+        return [(float(np.median(pred_cal)), 1.0, 0.0)]
+
+    segments.sort(key=lambda x: x[0])
+    return segments
+
+
+def apply_segmented_adjustment(pred: np.ndarray, segments: list) -> np.ndarray:
+    """
+    fit_segmented_ficr_adjustment()의 결과를 새 예측값에 적용.
+    구간 경계에서 값이 뚝 끊기지 않도록, 인접 구간 중심값 사이를 선형 보간해서
+    부드럽게 배율/이동을 섞음 (np.interp가 자동으로 처리; 범위 밖은 가장 가까운
+    구간의 값으로 고정 - 외삽하지 않음).
+    """
+    centers = np.array([s[0] for s in segments])
+    scales = np.array([s[1] for s in segments])
+    shifts = np.array([s[2] for s in segments])
+
+    if len(centers) == 1:
+        return pred * scales[0] + shifts[0]
+
+    pred_scale = np.interp(pred, centers, scales)
+    pred_shift = np.interp(pred, centers, shifts)
+    return pred * pred_scale + pred_shift

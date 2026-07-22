@@ -42,7 +42,7 @@ from train_baseline import (
     USE_LOG_TARGET,
 )
 from modeling import train_blended_ensemble, ensemble_predict
-from evaluate import metric, find_best_ficr_adjustment, group_score
+from evaluate import metric, find_best_ficr_adjustment, group_score, fit_segmented_ficr_adjustment, apply_segmented_adjustment
 
 CALIB_DAYS = 45
 # 백테스트는 속도 위해 시드 수를 줄임 (본 제출용 train_baseline.py는 더 많이 사용).
@@ -71,6 +71,7 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
     calib_start = calib_end - pd.Timedelta(days=CALIB_DAYS)
 
     pred_raw, pred_cal, actual = {}, {}, {}
+    pred_seg = {}
     pred_fa_by_shrink = {shrink: {} for shrink in SHRINKAGE_CANDIDATES}
 
     for target in TARGET_COLS:
@@ -155,6 +156,13 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
             sh = shrink * raw_shift
             pred_fa_by_shrink[shrink][target] = np.clip(pr_cal * s + sh, 0, CAPACITY_KWH[target])
 
+        # v27: 전역 조정(수축 0.5, 위 스윕의 shrink=0.5와 동일)과 비교하기 위해
+        # 구간별 조정(수축 0.5)도 같이 계산.
+        ficr_segments = fit_segmented_ficr_adjustment(
+            y_cal.values, pc_calibrated, CAPACITY_KWH[target], n_segments=3, shrinkage=0.5
+        )
+        pred_seg[target] = np.clip(apply_segmented_adjustment(pr_cal, ficr_segments), 0, CAPACITY_KWH[target])
+
         pred_raw[target] = pr_raw
         pred_cal[target] = pr_cal
         actual[target] = y_ho.values
@@ -186,6 +194,11 @@ def evaluate_window(holdout_start: pd.Timestamp, holdout_end: pd.Timestamp,
         result[f"score_fa_{shrink}"] = s
         result[f"ficr_fa_{shrink}"] = f
 
+    seg_df = to_df(pred_seg)
+    score_seg, nmae_seg, ficr_seg = metric(actual_df, seg_df, target_cols=included_groups, capacity=cap_subset)
+    result["score_seg"] = score_seg
+    result["ficr_seg"] = ficr_seg
+
     return result
 
 
@@ -210,6 +223,7 @@ def run_backtest() -> pd.DataFrame:
             results.append(r)
             print(f"  포함 그룹: {r['groups']}")
             fa_summary = ", ".join(f"{s}:{r[f'score_fa_{s}']:.4f}" for s in SHRINKAGE_CANDIDATES)
+            print(f"  Score(구간별조정, 수축0.5)={r['score_seg']:.4f}  (vs 전역조정 수축0.5={r['score_fa_0.5']:.4f})")
             print(f"  Score(raw)={r['score_raw']:.4f}  Score(calibrated)={r['score_cal']:.4f}")
             print(f"  Score(FICR조정, 수축비율별)= {fa_summary}")
         else:
@@ -242,6 +256,12 @@ def main():
     for shrink in SHRINKAGE_CANDIDATES:
         col = f"score_fa_{shrink}"
         print(f"{shrink:>10.1f}{df[col].mean():>14.4f}{df[col].std():>12.4f}")
+
+    print("\n" + "=" * 70)
+    print("[v27] 전역조정(수축0.5) vs 구간별조정(3구간, 수축0.5) 비교")
+    print("=" * 70)
+    print(f"전역조정   : {df['score_fa_0.5'].mean():.4f}  (±{df['score_fa_0.5'].std():.4f})")
+    print(f"구간별조정 : {df['score_seg'].mean():.4f}  (±{df['score_seg'].std():.4f})")
 
 
 if __name__ == "__main__":

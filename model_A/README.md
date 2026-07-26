@@ -19,7 +19,7 @@ baram2026_A/
 │   ├── train_labels_clean.csv
 │   └── scada_unison_clean.csv
 └── output/               # 예측 결과 (팀 공유용 — 6절 참고)
-    ├── submit_A.csv          # 최종 제출 파일 (앙상블+g1보정, = 0.63625)
+    ├── submit_A.csv          # 현재 최종 제출 파일 (앙상블+g1보정, = 0.63625)
     ├── pred_A_lgb.csv        # LightGBM 단독 예측
     ├── pred_A_cat.csv        # CatBoost 단독 예측
     └── pred_A_xgb.csv        # XGBoost 단독 예측

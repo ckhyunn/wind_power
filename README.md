@@ -123,3 +123,11 @@ Score = 0.5 x (1 - NMAE) + 0.5 x FICR
       구간을 나누며 구간당 calib 데이터가 60일→20일 수준으로 줄어든 게 원인으로
       추정. 전역조정(v25/26, 수축0.5)을 최종 유지. 함수는 evaluate.py/backtest.py에
       참고용으로 보존 - calib 기간을 늘리면 재시도 가치 있음.
+- [x] backtest.py를 진짜 walk-forward로 교정(v28) - 기존 blocked-CV 방식
+      (`~is_holdout & ~is_calib`)은 평가 윈도우보다 미래의 데이터도 학습에 포함시켜
+      평균 +0.008~0.010 낙관적인 점수를 만들고 있었음(diagnose_walkforward.py로 확인).
+      `dt_all < calib_start`로 교정해 그 시점 이전 데이터만 사용하도록 수정.
+      2022년 봄 윈도우는 이전 데이터가 3개월 미만이라 진짜 walk-forward 평가가
+      불가능해 제외(5→4개 윈도우). v17/v18에서 backtest 개선이 실전에 온전히
+      반영되지 않던 괴리가 이걸로 부분 설명됨. 다만 최종 채택된 v25는 실제
+      리더보드로 직접 검증된 것이라 그 결론 자체는 안전함.

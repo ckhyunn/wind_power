@@ -1,6 +1,11 @@
 # data
 data/*
 !data/README.md
+daeun_claude_pipeline/train
+daeun_claude_pipeline/test
+daeun_claude_pipeline/info.xlsx
+daeun_claude_pipeline/sample_submission.csv
+daeun_claude_pipeline/submissions/*.csv
 
 # python
 __pycache__/

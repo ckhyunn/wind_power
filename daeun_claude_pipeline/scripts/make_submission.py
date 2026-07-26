@@ -27,11 +27,12 @@ from src.metrics import group_scores
 from src.model import predict_lgbm, train_lgbm
 from src.submission import build_submission
 
-# EDA Open Question #7 (docs/eda_report.md §Open Questions/7) found no single grid
-# reduction method dominates for all 3 groups (mean best for group_1, nearest best for
-# groups 2/3, gap ~0.02-0.15 correlation) and explicitly recommends letting per-group CV
-# decide rather than hardcoding. This first cut hardcodes "mean" uniformly for simplicity
-# and revisits per-group choice in a follow-up iteration (see docs/submission_log.md).
+# Per-group grid reduction (idw/nearest/mean) was tried and reverted — the single
+# last-block holdout predicted a gain (macro 0.6240 -> 0.6291) but the real leaderboard
+# result was slightly *worse* than uniform mean (docs/submission_log.md "4차 제출":
+# 0.6059 -> 0.6044). Second time a holdout-validated change didn't hold up on the true
+# 2025 test period (after isotonic calibration in the 2nd submission) — reverting to the
+# uniform "mean" that's actually confirmed best on the real leaderboard so far.
 REDUCTION_METHOD = "mean"
 N_CV_SPLITS = 4
 NUM_BOOST_ROUND = 300
@@ -72,6 +73,11 @@ def main():
         y = base[group] / capacity
         dates = base["forecast_kst_dtm"]
 
+        # NOTE: isotonic calibration (src/calibration.py) was tried here and dropped —
+        # docs/submission_log.md "3차 제출" has the evidence: it helped in averaged
+        # multi-fold CV but *hurt* on a strict single last-block holdout and on the real
+        # leaderboard (2nd submission scored worse than the 1st). Not reapplying it
+        # without a calibration method that's shown to be robust to that gap.
         fold_actual, fold_pred = [], []
         for fold_i, (train_idx, test_idx) in enumerate(time_series_splits(dates, N_CV_SPLITS)):
             model = train_lgbm(design.iloc[train_idx], y.iloc[train_idx], num_boost_round=NUM_BOOST_ROUND)
@@ -95,10 +101,14 @@ def main():
         )
 
     scores = group_scores(cv_actual, cv_pred, CAPACITY_KWH)
-    print("\nCV NMAE (masked to eligible hours, docs/PLAN.md §1.2):")
+    print("\nCV scores (masked to eligible hours, docs/PLAN.md §1.2):")
     for group in TARGET_COLS:
-        print(f"  {group}: {scores[group]['nmae']:.4f}  (1-NMAE = {1 - scores[group]['nmae']:.4f})")
-    print(f"  macro_nmae: {scores['macro_nmae']:.4f}  (1-NMAE = {1 - scores['macro_nmae']:.4f})")
+        g = scores[group]
+        print(f"  {group}: nmae={g['nmae']:.4f} (1-NMAE={1 - g['nmae']:.4f})  ficr={g['ficr']:.4f}")
+    print(
+        f"  macro: 1-NMAE={1 - scores['macro_nmae']:.4f}  FICR={scores['macro_ficr']:.4f}"
+        f"  total_score={scores['total_score']:.4f}"
+    )
 
     submission = build_submission(sample_sub, test_predictions)
     out_dir = REPO_ROOT / "submissions"

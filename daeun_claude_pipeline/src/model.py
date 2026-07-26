@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_PARAMS = {
-    "objective": "regression",
+    "objective": "regression_l1",
     "metric": "mae",
     "learning_rate": 0.05,
     "num_leaves": 31,

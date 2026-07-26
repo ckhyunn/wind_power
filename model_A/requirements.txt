@@ -1,0 +1,8 @@
+numpy>=1.24
+pandas>=2.0
+lightgbm>=4.0
+catboost>=1.2
+xgboost>=2.0
+# (선택) 재튜닝·추가 실험용
+scikit-learn>=1.3
+optuna>=3.4

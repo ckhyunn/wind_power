@@ -1,0 +1,24 @@
+# === 대회 원본 데이터 (용량 커서 커밋 금지, 각자 로컬) ===
+train/
+test/
+sample_submission.csv
+*.grib*
+*.nc
+
+# === 실행 결과물 ===
+output/
+submit_*.csv
+pred_*.csv
+
+# === 파이썬 ===
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# === 로그/임시 ===
+*.log
+*.tmp
+_cache_*

@@ -1,5 +1,5 @@
 """
-LightGBM+XGBoost 블렌딩 베이스라인 (v25).
+LightGBM+XGBoost 블렌딩 베이스라인 (v29).
 
 공식 baseline(codeshare 14031) 대비 바뀐 점:
   1. LDAPS/GFS를 전국 평균 1개로 뭉치지 않고, 그룹별로 가장 가까운 격자를 골라
@@ -180,6 +180,18 @@ def build_group_weather(ldaps: pd.DataFrame, gfs: pd.DataFrame, group_coords: di
 
         # v17: 윈드시어 (고도별 풍속 차이) - 대기 안정도/난류 강도의 대리지표
         weather = add_wind_shear_feature(weather, "gfs_ws10_speed", "gfs_ws100_speed", "gfs")
+
+        # v29: 850hPa(약 1.5km 상공) 풍속/풍향 명시적 생성.
+        # 원본 u/v는 이미 집계에 포함돼있었지만(v22 feature importance에서 850hPa u가
+        # 전 그룹 1위였음), 풍속(sqrt(u^2+v^2))과 풍향은 한 번도 명시적으로 안 만듦.
+        # 팀원(현윤) A모델과 대조 결과: A는 850hPa '풍속'만 만들고 '풍향'은 100m까지만
+        # 만듦 -> 850hPa 풍향은 A에 없는 정보라 진짜 차별화 포인트.
+        weather = add_wind_features(
+            weather, "gfs_isobaricInhPa_850_u_mean", "gfs_isobaricInhPa_850_v_mean", "gfs_ws850"
+        )
+        # v29: 100m-850hPa 윈드시어. 기존 v17의 시어(10m-100m)보다 훨씬 큰 고도차라
+        # 다른 종류의 대기 안정도 정보를 담을 것으로 기대. A모델에 없음.
+        weather = add_wind_shear_feature(weather, "gfs_ws100_speed", "gfs_ws850_speed", "gfs_100_850")
 
         # v17: 인접 시간대(전/후 1시간) 풍속 - 지금까지 매 시간을 독립적으로 취급했는데,
         # 처음으로 시간적 흐름(급변/돌풍 여부) 정보를 제공
@@ -488,7 +500,7 @@ def main():
         submission[target] = predictions_test[target]
     submission["forecast_kst_dtm"] = pd.to_datetime(submission["forecast_kst_dtm"]).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    out_path = SUBMISSION_DIR / "baseline_v25_submit.csv"
+    out_path = SUBMISSION_DIR / "baseline_v29_submit.csv"
     submission.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n저장 완료: {out_path}")
 

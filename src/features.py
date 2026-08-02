@@ -152,6 +152,30 @@ def add_air_power_density_feature(df: pd.DataFrame, density_col: str, speed_cube
     return df
 
 
+def add_icing_risk_feature(df: pd.DataFrame, temp_col: str, wind_col: str, prefix: str,
+                            temp_min_c: float = -3.0, temp_max_c: float = 0.0, wind_min: float = 4.0) -> pd.DataFrame:
+    """
+    [v30] 착빙(icing) 위험 플래그.
+
+    diagnose_downtime_patterns.py에서 실증된 발견: '어는점 근처(-3~0도)'에서
+    '바람은 충분한데(>=4m/s) 발전량이 5% 미만'인 비율이 세 그룹 모두 13~16%로
+    다른 온도대(1~9%)보다 뚜렷이 높음(표본 975~1323시간으로 신뢰도 확보됨).
+
+    이건 트리가 원본 온도/풍속 컬럼만으로는 스스로 찾기 어려운 '좁은 문턱
+    상호작용'(넓은 범위에서 매끄럽게 나타나는 관계가 아니라 아주 좁은 구간에서만
+    발생)이라, 명시적으로 알려주는 게 도움이 될 가능성이 있음 (v19의 매끄러운
+    상호작용항과는 성격이 다름 - 그건 실패했지만 이건 다를 수 있음).
+
+    temp_col: 켈빈 온도 컬럼 (내부에서 섭씨로 변환)
+    """
+    df = df.copy()
+    temp_c = df[temp_col] - 273.15
+    df[f"{prefix}_icing_risk"] = (
+        (temp_c >= temp_min_c) & (temp_c <= temp_max_c) & (df[wind_col] >= wind_min)
+    ).astype(int)
+    return df
+
+
 def add_lag_lead_features(weather: pd.DataFrame, cols: list, dt_col: str = "forecast_kst_dtm") -> pd.DataFrame:
     """
     인접 시간대(전/후 1시간) 값을 피처로 추가.

@@ -1,6 +1,9 @@
 # data
 data/*
 !data/README.md
+model_A_dh/cleaned/
+model_A_dh/features/
+model_A_dh/output/
 
 # python
 __pycache__/

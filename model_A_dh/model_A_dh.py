@@ -27,6 +27,7 @@
 =========================================================================
 """
 import numpy as np, pandas as pd
+from sklearn.ensemble import IsolationForest
 from pathlib import Path
 import lightgbm as lgb
 from catboost import CatBoostRegressor
@@ -50,17 +51,39 @@ CFG = {
     "USE_PERGRID_DIR": True,   # 격자별 풍향(sin/cos)
     "USE_850_DIR":       True,   # [동훈추가] GFS 850hPa 격자별 풍향(sin/cos) - 원본엔 없던 것
     "USE_PRESSURE_TEND": False,  # [동훈추가] 기압 3h/6h 경향 - 실험 결과 효과 없어 기각, 꺼둠
+    "USE_OUTLIER_FILTER": True,  # [동훈추가] 학습단계 이상치 제거 (풍속충분+거의무발전=
+    # 착빙/강제정지 등 물리적 이상 -> 평시 풍속-발전량 관계 오염 방지 위해 학습에서 제외)
+    "OUTLIER_WS_THRESHOLD": 8.0,       # 이 풍속(m/s) 이상이면 '발전 가능한 바람'으로 간주
+    "OUTLIER_OUTPUT_THRESHOLD": 0.30,  # [동훈수정] 0.10은 USE_10PCT_CUT과 완전히 겹쳐서
+    # 무효(순수추가분 0건)였음 - quick_check_outlier_threshold.py로 확인 후 0.30으로 조정.
+    "USE_TYPHOON_DOWNWEIGHT": True,   # [동훈추가] 태풍형(저기압+고습) 이상치는 완전제외가
+    # 아니라 가중치만 낮춤 - detect_outliers_multivariate.py에서 확인: 착빙형(풍속대비
+    # 발전량 이상)과 달리 태풍형은 개별변수가 실제로 극단적인 '진짜' 상황이라, 완전히
+    # 배제하면 2025년 유사 강풍(산불 사건 등) 학습기회를 잃을 위험이 있음.
+    "TYPHOON_SP_THRESHOLD": 94000,     # Pa - 이보다 낮으면 저기압
+    "TYPHOON_RH_THRESHOLD": 90,        # % - 이보다 높으면 고습
+    "TYPHOON_WEIGHT_FACTOR": 0.3,      # 조건 해당 시 가중치를 이 비율로 낮춤(완전제외 아님)
     "USE_WAKE_ALIGN":    False,  # [동훈추가] 그룹1->그룹2 후류 정렬 지수 - SCADA 실측 풍속으로 검증시 반대방향(기각)
     "PRESSURE_TEND_EXCLUDE_GROUPS": ["kpx_group_2"],  # (USE_PRESSURE_TEND=False라 현재 미사용)
     # --- 학습/후처리 기법 ---
     "USE_GEN_WEIGHT":  True,   # 발전량 가중치(0.5 + y/용량)
     "USE_10PCT_CUT":   True,   # 발전량<용량10% 시간 학습 제외
     "USE_G3_DENOISE":  True,   # group3 라벨 정제(unison SCADA와 1000kWh 초과 어긋난 시간 제외)
-    "USE_G1_CALIB":    True,   # group1 편향 보정
+    "USE_G1_CALIB":    True,   # (레거시, 아래 CALIB_GROUPS로 대체됨 - 호환용으로만 유지)
+    "CALIB_GROUPS": ["kpx_group_2", "kpx_group_3"],  # [동훈수정] group1 제외
+    # (fold A/B 양쪽에서 계속 그룹1만 보정 후 하락하는 패턴이 반복됨 - 그룹1은 원래
+    # 850hPa 단독 확정판 상태(보정 없음)가 최선이었던 것으로 판단, group2·3만 보정 적용)
+    "OUTLIER_FILTER_GROUPS": ["kpx_group_2", "kpx_group_3"],  # [동훈추가] 이상치필터/태풍
+    # 다운웨이트도 그룹1은 제외 - CALIB_GROUPS만 뺐더니 그룹1 학습데이터 자체가 여전히
+    # 이상치필터의 영향을 받아 원래 850hPa 단독 확정판과 달라져 있었음(fold B g1이
+    # 원기준선 0.6410보다도 낮은 0.6292로 나온 원인). 그룹1은 전부 원래 상태로 고정.
+    # 그룹1에만 적용하던 것을 전 그룹으로 확장 (경계선 오차 시간대를 문턱 밑으로 밀어
+    # FICR 개선을 겨냥 - check_temp_threshold_upperbound.py 등에서 확인된 대로
+    # '경계선(8~12%) 시간대'가 가장 효율 높은 개선 대상이라는 분석 근거)
     "USE_SMOOTH":      True,   # 예보블록 내 3시간 이동중앙값 스무딩
     # --- 실행 옵션 ---
     "RUN_2FOLD":       True,   # 2-fold 검증(2023/2024) 실행
-    "MAKE_SUBMISSION": False,   # 최종 제출 파일 생성 (빠른 스크리닝용, 확정시 True로)
+    "MAKE_SUBMISSION": True,   # 최종 제출 파일 생성 (빠른 스크리닝용, 확정시 True로)
     "SAVE_INDIVIDUAL": True,   # 각 모델 단독 예측(test) 저장 (동훈 분석/블렌딩용)
 }
 
@@ -83,7 +106,8 @@ FOLD_A = (pd.Timestamp("2023-01-01 01:00:00"), pd.Timestamp("2024-01-01 00:00:00
 FOLD_B = (pd.Timestamp("2024-01-01 01:00:00"), pd.Timestamp("2025-01-01 00:00:00"))
 # gain 중요도 하위 30% 가지치기에서 미리 제외했던 피처
 REMOVED = ["ldaps_l50_ws3_max", "ldaps_l50_ws3_mean", "ldaps_l50_ws3_min", "ldaps_l50_ws_mean",
-           "ldaps_l_power_proxy_min", "ldaps_surface_0_lssrate_mean"]
+           "ldaps_l_power_proxy_min", "ldaps_surface_0_lssrate_mean",
+           "_ws100_outlier_check", "_sp_outlier_check", "_rh_outlier_check"]  # [동훈추가] 필터링 전용
 
 # ========================== 데이터 로드 ==========================
 labels = pd.read_csv(CLEAN_DIR / "train_labels_clean.csv", encoding="utf-8-sig",
@@ -195,6 +219,17 @@ def build_features():
         # [동훈추가] GFS 850hPa 격자별 풍향 - 원본엔 100m까지만 있던 것을 확장
         X = X.join(pergrid_dir(DATA_DIR / "train/gfs_train.csv", "pgg850d", "isobaricInhPa_850_u", "isobaricInhPa_850_v"))
         Xte = Xte.join(pergrid_dir(DATA_DIR / "test/gfs_test.csv", "pgg850d", "isobaricInhPa_850_u", "isobaricInhPa_850_v"))
+
+    # [동훈추가] 이상치(착빙/강제정지 등) 필터용 내부 풍속 컬럼. FEATS에는 안 넣음(피처가
+    # 아니라 학습데이터 필터링에만 씀 - REMOVED에 추가해서 prune_features 이후에도 제외됨).
+    X["_ws100_outlier_check"] = np.sqrt(X["base_gf_heightAboveGround_100_100u"]**2 + X["base_gf_heightAboveGround_100_100v"]**2)
+    Xte["_ws100_outlier_check"] = np.sqrt(Xte["base_gf_heightAboveGround_100_100u"]**2 + Xte["base_gf_heightAboveGround_100_100v"]**2)
+    # [동훈추가] 태풍형 다운웨이트(완전제외 아님)용 - detect_outliers_multivariate.py에서
+    # 확인된 태풍 특징(저기압+고습도) 판정용 내부 컬럼
+    X["_sp_outlier_check"] = X["base_gf_surface_0_sp"]
+    Xte["_sp_outlier_check"] = Xte["base_gf_surface_0_sp"]
+    X["_rh_outlier_check"] = X["base_gf_heightAboveGround_2_2r"]
+    Xte["_rh_outlier_check"] = Xte["base_gf_heightAboveGround_2_2r"]
     return X, Xte
 
 def prune_features(X):
@@ -217,6 +252,30 @@ def g3mask(idx):
     l3 = labels["kpx_group_3"].reindex(idx); s3 = hu.reindex(idx)
     return ~(((l3 - s3).abs() > 1000) & l3.notna() & s3.notna())
 
+def outlier_mask(Xdf, y, cap, group=None):
+    """[동훈추가] 풍속충분(>=OUTLIER_WS_THRESHOLD)한데 거의무발전(<OUTLIER_OUTPUT_THRESHOLD)
+    = 착빙/강제정지 등 물리적 이상으로 간주해 학습에서 제외할 마스크(True=학습에 포함).
+    오차율 기준이 아니라 물리적 개연성 기준이라 순환논리 없음 - 모델 예측 불필요.
+    group이 OUTLIER_FILTER_GROUPS에 없으면 그 그룹은 원본 그대로(전부 True)."""
+    if not CFG["USE_OUTLIER_FILTER"] or (group is not None and group not in CFG["OUTLIER_FILTER_GROUPS"]):
+        return pd.Series(True, index=y.index)
+    ws = Xdf["_ws100_outlier_check"].reindex(y.index)
+    is_outlier = (ws >= CFG["OUTLIER_WS_THRESHOLD"]) & (y < cap * CFG["OUTLIER_OUTPUT_THRESHOLD"])
+    return ~is_outlier.fillna(False)
+
+def typhoon_weight_factor(Xdf, idx, group=None):
+    """[동훈추가] 태풍형(저기압+고습) 다운웨이트 계수. 완전제외(outlier_mask)와 달리
+    가중치만 낮춤 - 진짜 극단상황이라 완전배제 시 유사 미래사례 학습기회 손실 위험.
+    group이 OUTLIER_FILTER_GROUPS에 없으면 그 그룹은 가중치 그대로(전부 1.0)."""
+    if not CFG["USE_TYPHOON_DOWNWEIGHT"] or (group is not None and group not in CFG["OUTLIER_FILTER_GROUPS"]):
+        return pd.Series(1.0, index=idx)
+    sp = Xdf["_sp_outlier_check"].reindex(idx)
+    rh = Xdf["_rh_outlier_check"].reindex(idx)
+    is_typhoon = (sp < CFG["TYPHOON_SP_THRESHOLD"]) & (rh > CFG["TYPHOON_RH_THRESHOLD"])
+    factor = pd.Series(1.0, index=idx)
+    factor[is_typhoon.fillna(False)] = CFG["TYPHOON_WEIGHT_FACTOR"]
+    return factor
+
 def gscore(a, f, cap):
     """대회 지표(그룹별): 0.5*(1-평균오차) + 0.5*발전량가중 밴드점수(≤6%4,≤8%3,>8%0)."""
     v = (a >= cap * 0.10) & ~np.isnan(a); er = np.abs(f[v] - a[v]) / cap
@@ -235,18 +294,23 @@ def predict_components(Xtr, Xout, FEATS):
         y = labels[gg].reindex(Xtr.index); m = y.notna()
         if CFG["USE_10PCT_CUT"]: m &= (y >= CAP[gg] * 0.10)
         if gg == "kpx_group_3": m &= dm
+        m &= outlier_mask(Xtr, y, CAP[gg], group=gg)  # [동훈추가]
         xg = Xtr.loc[m, FEATS].copy(); xg["group_id"] = gi; xs.append(xg)
-        yy = y[m] / CAP[gg]; ys.append(yy); ws.append(_sw(y[m], CAP[gg]))
+        yy = y[m] / CAP[gg]; ys.append(yy)
+        w_typhoon = typhoon_weight_factor(Xtr, y[m].index, group=gg)  # [동훈추가]
+        ws.append(_sw(y[m], CAP[gg]) * w_typhoon.to_numpy())
     SX, SY, SW = pd.concat(xs), pd.concat(ys), np.concatenate(ws)
     for g in TARGETS:
         pool = (g == "kpx_group_3"); y = labels[g].reindex(Xtr.index); m = y.notna()
         if CFG["USE_10PCT_CUT"]: m &= (y >= CAP[g] * 0.10)
         if pool: m &= dm
+        m &= outlier_mask(Xtr, y, CAP[g], group=g)  # [동훈추가]
         # [동훈추가] group별 피처 제외 - group3(pool)은 구조상 배제 불가하므로 개별학습(g1/g2)만 적용
         group_feats = FEATS
         if (not pool) and g in CFG.get("PRESSURE_TEND_EXCLUDE_GROUPS", []):
             group_feats = [f for f in FEATS if "tendency" not in f]
-        w = _sw(y[m], CAP[g]); Xtrm = Xtr.loc[m, group_feats]; Xof = Xout[group_feats]; cap = CAP[g]
+        w = _sw(y[m], CAP[g]) * typhoon_weight_factor(Xtr, y[m].index, group=g).to_numpy()  # [동훈추가]
+        Xtrm = Xtr.loc[m, group_feats]; Xof = Xout[group_feats]; cap = CAP[g]
         # LightGBM (시드 평균)
         if "lgb" in CFG["MODELS"]:
             ps = []
@@ -286,8 +350,13 @@ def fit_debias(f, a, cap, nbin=6):
     gb = d.groupby("b").agg(fc=("f", "median"), dl=("a", lambda s: np.median(s.values - d.loc[s.index, "f"].values)))
     return gb["fc"].to_numpy(), gb["dl"].to_numpy()
 
-def apply_cal(f, fc, dl, cap):
-    return np.clip(f + np.interp(f, fc, dl, left=dl[0], right=dl[-1]), 0, cap)
+def apply_cal(f, fc, dl, cap, shrinkage=1.0):
+    # [동훈추가] shrinkage - v25/26(FICR조정)에서 검증된 원칙 재사용. Fold A에서
+    # 편향보정이 과적합 위험을 보여(calib 구간이 2022년 11~12월, 데이터 초창기라
+    # 대표성이 낮을 수 있음), 보정값을 100% 그대로 적용하지 않고 일부만 적용해서
+    # 위험을 줄임.
+    offset = np.interp(f, fc, dl, left=dl[0], right=dl[-1])
+    return np.clip(f + offset * shrinkage, 0, cap)
 
 # ========================== 실행 ==========================
 def main():
@@ -298,11 +367,48 @@ def main():
     # --- 2-fold 검증 ---
     if CFG["RUN_2FOLD"]:
         print("[2-fold 검증]", flush=True)
+        CALIB_DAYS = 45  # [동훈추가] fold와 최종제출이 반드시 같은 calib 방식을 쓰도록 통일
         for fold, (vs, ve), grp in [("A", FOLD_A, TARGETS[:2]), ("B", FOLD_B, TARGETS)]:
-            Xtr = X[X.index < vs]; va = (X.index >= vs) & (X.index <= ve); Xva = X[va]
-            comp = predict_components(Xtr, Xva, FEATS)
-            sc = np.nanmean([gscore(labels[g].reindex(Xva.index).to_numpy(float), blend(comp, g, Xva), CAP[g]) for g in grp])
-            print(f"  fold {fold}: {sc:.4f}", flush=True)
+            calib_end = vs - pd.Timedelta(days=1)
+            calib_start = calib_end - pd.Timedelta(days=CALIB_DAYS)
+            Xtr = X[X.index < calib_start]
+            Xcalib = X[(X.index >= calib_start) & (X.index <= calib_end)]
+            va = (X.index >= vs) & (X.index <= ve); Xva = X[va]
+            Xout_combined = pd.concat([Xcalib, Xva])
+            comp = predict_components(Xtr, Xout_combined, FEATS)
+
+            group_scores = {}
+            fold_b_dump = {}
+            for g in grp:
+                p_all = blend(comp, g, Xout_combined)
+                p_calib, p_va = p_all[:len(Xcalib)], p_all[len(Xcalib):]
+                a_calib = labels[g].reindex(Xcalib.index).to_numpy(float)
+                a_va = labels[g].reindex(Xva.index).to_numpy(float)
+
+                p_va_raw = p_va.copy()  # [동훈추가] 보정 전 값 따로 보관
+                if g in CFG["CALIB_GROUPS"]:
+                    fc, dl = fit_debias(p_calib, a_calib, CAP[g])
+                    p_va = apply_cal(p_va, fc, dl, CAP[g])
+
+                group_scores[g] = gscore(a_va, p_va, CAP[g])
+                if fold == "B":
+                    fold_b_dump[g] = {"actual": a_va, "pred_before": p_va_raw, "pred_after": p_va}
+
+            if fold == "B":
+                # [동훈추가] Phase1/Phase3 진단 도구(diagnose_error_matrix.py, slice_eval)에서
+                # 쓸 수 있도록 보정 전/후 예측값을 CSV로 저장
+                out_rows = []
+                for g in grp:
+                    d = fold_b_dump[g]
+                    for i, dt in enumerate(Xva.index):
+                        out_rows.append({"dt": dt, "group": g, "actual": d["actual"][i],
+                                          "pred_before": d["pred_before"][i], "pred_after": d["pred_after"][i]})
+                pd.DataFrame(out_rows).to_csv(OUT_DIR / "fold_b_calib_before_after.csv", index=False, encoding="utf-8-sig")
+                print(f"  Fold B 보정전/후 예측값 저장: fold_b_calib_before_after.csv", flush=True)
+
+            sc = np.nanmean(list(group_scores.values()))
+            detail = ", ".join(f"{g}={s:.4f}" for g, s in group_scores.items())
+            print(f"  fold {fold}: {sc:.4f}  ({detail})", flush=True)
 
     if not CFG["MAKE_SUBMISSION"]:
         return
@@ -310,9 +416,14 @@ def main():
     # --- 전체 학습 → 예측 ---
     print("[전체 학습 → 예측]", flush=True)
     compTe = predict_components(X, Xte, FEATS)
-    XtrB = X[X.index < FOLD_B[0]]; vb = (X.index >= FOLD_B[0]) & (X.index <= FOLD_B[1]); XvaB = X[vb]
-    if CFG["USE_G1_CALIB"]:
-        compB = predict_components(XtrB, XvaB, FEATS)  # g1 보정용 2024 예측
+
+    # [동훈추가] fold 검증과 정확히 동일한 45일 calib 방식 (이전 FICR조정 실패의 원인이었던
+    # 'fold와 제출 로직 불일치'를 반복하지 않기 위해 반드시 동일 로직 사용)
+    calib_end_final = X.index.max() - pd.Timedelta(days=0)  # 학습데이터 마지막 시점
+    calib_start_final = calib_end_final - pd.Timedelta(days=45)
+    XtrFinal = X[X.index < calib_start_final]
+    XcalibFinal = X[X.index >= calib_start_final]
+    compFinalCalib = predict_components(XtrFinal, XcalibFinal, FEATS)
 
     sample = pd.read_csv(DATA_DIR / "sample_submission.csv", encoding="utf-8-sig")
     sdt = pd.to_datetime(sample["forecast_kst_dtm"])
@@ -327,14 +438,15 @@ def main():
             sub.to_csv(OUT_DIR / f"pred_A_{mdl}.csv", index=False, encoding="utf-8-sig")
         print("  개별 예측 저장: pred_A_*.csv", flush=True)
 
-    # 앙상블 + g1 보정
+    # 앙상블 + 그룹별 편향보정 (fold와 동일 45일 calib 로직)
     sub = sample[["forecast_id", "forecast_kst_dtm"]].copy()
     for g in TARGETS:
         sub[g] = pd.Series(blend(compTe, g, Xte), index=Xte.index).reindex(sdt.values).to_numpy()
-    if CFG["USE_G1_CALIB"]:
-        pB1 = blend(compB, "kpx_group_1", XvaB); aB1 = labels["kpx_group_1"].reindex(XvaB.index).to_numpy(float)
-        fc, dl = fit_debias(pB1, aB1, CAP["kpx_group_1"])
-        sub["kpx_group_1"] = apply_cal(sub["kpx_group_1"].to_numpy(float), fc, dl, CAP["kpx_group_1"])
+    for g in CFG["CALIB_GROUPS"]:
+        pC = blend(compFinalCalib, g, XcalibFinal)
+        aC = labels[g].reindex(XcalibFinal.index).to_numpy(float)
+        fc, dl = fit_debias(pC, aC, CAP[g])
+        sub[g] = apply_cal(sub[g].to_numpy(float), fc, dl, CAP[g])
     for g in TARGETS: sub[g] = np.clip(sub[g], 0, CAP[g])
 
     # 검증 후 저장

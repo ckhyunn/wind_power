@@ -44,12 +44,22 @@ OUT_DIR.mkdir(exist_ok=True)
 CFG = {
     # --- 앙상블 ---
     "MODELS":        ["lgb", "cat", "xgb"],          # 넣을 모델. 예: ["lgb"] / ["lgb","xgb"]
-    "WEIGHTS":       {"lgb": 0.50, "cat": 0.10, "xgb": 0.40},  # 앙상블 비율(선택 모델만 자동 재정규화)
+    "WEIGHTS":       {"lgb": 0.50, "cat": 0.10, "xgb": 0.40},  # 앙상블 비율(선택 모델만 자동 재정규화, 폴백/기본값)
+    "GROUP_WEIGHTS": {  # [동훈추가] 그룹별 최적 가중치 - 실제 2024 fold 개별모델 예측으로
+        # 그리드서치해서 확인 (재학습 없이 pred_A_lgb/cat/xgb_2024.csv + actual_2024.csv만
+        # 사용). 그룹마다 최적 조합이 확연히 다름 - 전그룹 공통 고정값(0.5/0.1/0.4)이 최적이
+        # 아니었음. group_score 기준 확인된 개선폭: g1 +0.0032, g2 +0.0019, g3 +0.0013.
+        "kpx_group_1": {"lgb": 0.9, "cat": 0.0, "xgb": 0.1},
+        "kpx_group_2": {"lgb": 0.5, "cat": 0.5, "xgb": 0.0},
+        "kpx_group_3": {"lgb": 0.3, "cat": 0.6, "xgb": 0.1},
+    },
     "N_SEEDS":       5,                               # LGBM 시드 평균 개수 (빠른 스크리닝용, 확정시 5로)
     # --- 피처 ---
     "USE_PERGRID":     True,   # 격자별 풍속 피처(ws10/ws50/ws50³, gfs ws100/80/850/ws100³)
     "USE_PERGRID_DIR": True,   # 격자별 풍향(sin/cos)
     "USE_850_DIR":       True,   # [동훈추가] GFS 850hPa 격자별 풍향(sin/cos) - 원본엔 없던 것
+    "USE_T_INSTABILITY": False,  # 연직 대기불안정도(지표기온-700hPa기온) - fold개선(+0.001대)했으나
+    # 실제 리더보드 하락(-0.00069)으로 기각
     "USE_PRESSURE_TEND": False,  # [동훈추가] 기압 3h/6h 경향 - 실험 결과 효과 없어 기각, 꺼둠
     "USE_OUTLIER_FILTER": True,  # [동훈추가] 학습단계 이상치 제거 (풍속충분+거의무발전=
     # 착빙/강제정지 등 물리적 이상 -> 평시 풍속-발전량 관계 오염 방지 위해 학습에서 제외)
@@ -70,7 +80,19 @@ CFG = {
     "USE_10PCT_CUT":   True,   # 발전량<용량10% 시간 학습 제외
     "USE_G3_DENOISE":  True,   # group3 라벨 정제(unison SCADA와 1000kWh 초과 어긋난 시간 제외)
     "USE_G1_CALIB":    True,   # (레거시, 아래 CALIB_GROUPS로 대체됨 - 호환용으로만 유지)
-    "CALIB_GROUPS": ["kpx_group_2", "kpx_group_3"],  # [동훈수정] group1 제외
+    "CALIB_GROUPS": ["kpx_group_1", "kpx_group_2", "kpx_group_3"],  # [동훈재수정] group1 재포함
+    # - 이전 실패는 shrinkage=1.0(전량적용) 기본값 때문이었던 것으로 판명. 3개 분할점
+    # (1~3/6/9월 calib)으로 검증한 결과 shrinkage=0.5에서 전부 일관되게 Score 개선
+    # (+0.009~0.014) 확인됨 - 우연이 아님. shrinkage=1.0(과거 실패했던 그대로)만 위험.
+    "CALIB_SHRINKAGE": {"kpx_group_1": 0.5, "kpx_group_2": 1.0, "kpx_group_3": 1.0},
+    "CALIB_DAYS_PER_GROUP": {"kpx_group_1": 30, "kpx_group_2": 45, "kpx_group_3": 45},  # [동훈추가]
+    # 그룹1은 30일이 최적으로 확인됨(11/16 분할점에서 +0.0220, 45일보다 좋음). 전체 calib
+    # 구간(45일)은 공통으로 확보하되, 그룹1만 그 중 최근 30일만 잘라서 fit_debias에 씀.
+    "RECENCY_WEIGHT_GROUPS": {},  # [동훈수정] group1(wtg05)도 fold선 미세개선이었으나 실제
+    # 리더보드는 하락(0.64129->0.64069) - 완전 기각. group2(wtg07)도 이미 기각됨.
+    "CALIB_NBIN": {"kpx_group_2": 6, "kpx_group_3": 20},  # [동훈추가] fit_debias 구간 수.
+    # 그룹3만 6->20으로 늘림 - gap감소율(5.8%->8.8%)과 Score(+0.013) 둘 다 뚜렷이 개선.
+    # 그룹2는 구간을 늘려도 차이 없어 그대로(6) 유지.
     # (fold A/B 양쪽에서 계속 그룹1만 보정 후 하락하는 패턴이 반복됨 - 그룹1은 원래
     # 850hPa 단독 확정판 상태(보정 없음)가 최선이었던 것으로 판단, group2·3만 보정 적용)
     "OUTLIER_FILTER_GROUPS": ["kpx_group_2", "kpx_group_3"],  # [동훈추가] 이상치필터/태풍
@@ -209,6 +231,9 @@ def build_features():
     if CFG["USE_WAKE_ALIGN"]:
         # [동훈추가] 마찬가지로 base_gf_heightAboveGround_100_100u/v 컬럼이 필요해 이 위치
         X = add_wake_alignment_feature(X); Xte = add_wake_alignment_feature(Xte)
+    if CFG["USE_T_INSTABILITY"]:
+        X["t_instability"] = X["base_gf_heightAboveGround_2_2t"] - X["base_gf_isobaricInhPa_700_t"]
+        Xte["t_instability"] = Xte["base_gf_heightAboveGround_2_2t"] - Xte["base_gf_isobaricInhPa_700_t"]
     if CFG["USE_PERGRID"]:
         X = X.join(pergrid(DATA_DIR / "train/ldaps_train.csv", "pgl", LP, cube_of=("ws50",))).join(pergrid(DATA_DIR / "train/gfs_train.csv", "pgg", GP, cube_of=("ws100",)))
         Xte = Xte.join(pergrid(DATA_DIR / "test/ldaps_test.csv", "pgl", LP, cube_of=("ws50",))).join(pergrid(DATA_DIR / "test/gfs_test.csv", "pgg", GP, cube_of=("ws100",)))
@@ -285,6 +310,19 @@ def gscore(a, f, cap):
 def _sw(y, cap):
     return (0.5 + y / cap).to_numpy() if CFG["USE_GEN_WEIGHT"] else np.ones(len(y))
 
+def _recency_weight(idx, group):
+    """[동훈추가] wtg07 만성저성능의 완만한 개선추세(2022 ~60%대 -> 2024 ~68~70%대)를
+    반영해 group2 학습 시 최근(2024) 데이터에 더 높은 가중치를 줌. 다른 그룹은 영향없음."""
+    factors = CFG.get("RECENCY_WEIGHT_GROUPS", {})
+    if group not in factors:
+        return np.ones(len(idx))
+    year = idx.year
+    w = np.ones(len(idx), dtype=float)
+    w[year == 2022] = factors[group].get(2022, 1.0)
+    w[year == 2023] = factors[group].get(2023, 1.0)
+    w[year == 2024] = factors[group].get(2024, 1.0)
+    return w
+
 def predict_components(Xtr, Xout, FEATS):
     """그룹별·모델별 예측 {g:{'lgb','cat','xgb'}} (스무딩 전 raw)."""
     out = {g: {} for g in TARGETS}; dm = g3mask(Xtr.index)
@@ -309,7 +347,7 @@ def predict_components(Xtr, Xout, FEATS):
         group_feats = FEATS
         if (not pool) and g in CFG.get("PRESSURE_TEND_EXCLUDE_GROUPS", []):
             group_feats = [f for f in FEATS if "tendency" not in f]
-        w = _sw(y[m], CAP[g]) * typhoon_weight_factor(Xtr, y[m].index, group=g).to_numpy()  # [동훈추가]
+        w = _sw(y[m], CAP[g]) * typhoon_weight_factor(Xtr, y[m].index, group=g).to_numpy() * _recency_weight(y[m].index, g)  # [동훈추가]
         Xtrm = Xtr.loc[m, group_feats]; Xof = Xout[group_feats]; cap = CAP[g]
         # LightGBM (시드 평균)
         if "lgb" in CFG["MODELS"]:
@@ -339,8 +377,11 @@ def _smooth(raw, Xout, cap):
     return np.clip(raw, 0, cap)
 
 def blend(comp, g, Xout):
-    """선택 모델을 정규화된 가중치로 섞고 스무딩+클리핑."""
-    cap = CAP[g]; ws = {k: CFG["WEIGHTS"][k] for k in CFG["MODELS"]}; s = sum(ws.values())
+    """선택 모델을 정규화된 가중치로 섞고 스무딩+클리핑.
+    [동훈수정] 그룹별 최적 가중치(GROUP_WEIGHTS)를 우선 사용, 없으면 공통 WEIGHTS로 폴백."""
+    cap = CAP[g]
+    gw = CFG["GROUP_WEIGHTS"].get(g, CFG["WEIGHTS"])
+    ws = {k: gw[k] for k in CFG["MODELS"]}; s = sum(ws.values())
     raw = sum(ws[k] / s * comp[g][k] for k in CFG["MODELS"])
     return _smooth(raw, Xout, cap)
 
@@ -387,8 +428,12 @@ def main():
 
                 p_va_raw = p_va.copy()  # [동훈추가] 보정 전 값 따로 보관
                 if g in CFG["CALIB_GROUPS"]:
-                    fc, dl = fit_debias(p_calib, a_calib, CAP[g])
-                    p_va = apply_cal(p_va, fc, dl, CAP[g])
+                    # [동훈추가] 그룹별 calib일수만큼만 최근 구간 사용
+                    g_days = CFG["CALIB_DAYS_PER_GROUP"].get(g, CALIB_DAYS)
+                    g_calib_start = calib_end - pd.Timedelta(days=g_days)
+                    g_mask = Xcalib.index >= g_calib_start
+                    fc, dl = fit_debias(p_calib[g_mask], a_calib[g_mask], CAP[g], nbin=CFG["CALIB_NBIN"].get(g, 6))
+                    p_va = apply_cal(p_va, fc, dl, CAP[g], shrinkage=CFG["CALIB_SHRINKAGE"].get(g, 1.0))
 
                 group_scores[g] = gscore(a_va, p_va, CAP[g])
                 if fold == "B":
@@ -443,10 +488,14 @@ def main():
     for g in TARGETS:
         sub[g] = pd.Series(blend(compTe, g, Xte), index=Xte.index).reindex(sdt.values).to_numpy()
     for g in CFG["CALIB_GROUPS"]:
-        pC = blend(compFinalCalib, g, XcalibFinal)
-        aC = labels[g].reindex(XcalibFinal.index).to_numpy(float)
-        fc, dl = fit_debias(pC, aC, CAP[g])
-        sub[g] = apply_cal(sub[g].to_numpy(float), fc, dl, CAP[g])
+        pC_full = blend(compFinalCalib, g, XcalibFinal)
+        aC_full = labels[g].reindex(XcalibFinal.index).to_numpy(float)
+        # [동훈추가] 그룹별 calib일수만큼만 최근 구간 사용 (fold와 동일 로직)
+        g_days = CFG["CALIB_DAYS_PER_GROUP"].get(g, 45)
+        g_calib_start = calib_end_final - pd.Timedelta(days=g_days)
+        g_mask = XcalibFinal.index >= g_calib_start
+        fc, dl = fit_debias(pC_full[g_mask], aC_full[g_mask], CAP[g], nbin=CFG["CALIB_NBIN"].get(g, 6))
+        sub[g] = apply_cal(sub[g].to_numpy(float), fc, dl, CAP[g], shrinkage=CFG["CALIB_SHRINKAGE"].get(g, 1.0))
     for g in TARGETS: sub[g] = np.clip(sub[g], 0, CAP[g])
 
     # 검증 후 저장
